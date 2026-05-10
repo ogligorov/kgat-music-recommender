@@ -145,6 +145,7 @@ def build_id_mappings(
         "idx_to_tag": {i: int(tid) for i, tid in enumerate(tag_ids)},
         "idx_to_era": {i: era for i, era in enumerate(DECADE_BUCKETS)},
         "artist_id_to_name": dict(zip(artists_df["id"], artists_df["name"])),
+        "tag_id_to_name": dict(zip(tags_df["tagID"], tags_df["tagValue"])),
     }
 
 
@@ -200,7 +201,7 @@ def main():
     ua_artists = user_artists_df["artistID"].map(mappings["artist_to_idx"]).values
     valid = ~(np.isnan(ua_users) | np.isnan(ua_artists))
     listens_edge_index = torch.tensor(
-        np.stack([ua_users[valid], ua_artists[valid]]), dtype=torch.long
+        np.stack([ua_users[valid].astype(np.int64), ua_artists[valid].astype(np.int64)]), dtype=torch.long
     )
     listens_weights = torch.tensor(
         np.log1p(user_artists_df["weight"].values[valid]), dtype=torch.float
@@ -211,7 +212,7 @@ def main():
     at_tags = artist_tag_pairs["tagID"].map(mappings["tag_to_idx"]).values
     valid = ~(np.isnan(at_artists) | np.isnan(at_tags))
     tagged_edge_index = torch.tensor(
-        np.stack([at_artists[valid], at_tags[valid]]), dtype=torch.long
+        np.stack([at_artists[valid].astype(np.int64), at_tags[valid].astype(np.int64)]), dtype=torch.long
     )
 
     # Build active_in_era edges via MusicBrainz

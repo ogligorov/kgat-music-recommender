@@ -13,9 +13,7 @@ def popularity_baseline(data: HeteroData, top_k_values: list[int]) -> dict:
 
     # Count artist popularity from training set
     n_artists = data["artist"].num_nodes
-    artist_counts = torch.zeros(n_artists)
-    for i in range(train_edges.shape[1]):
-        artist_counts[train_edges[1, i]] += 1
+    artist_counts = torch.bincount(train_edges[1], minlength=n_artists).float()
 
     # Get test ground truth
     test_mask = data["user", "listens_to", "artist"].test_mask

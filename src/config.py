@@ -6,7 +6,7 @@ import torch
 
 @dataclass
 class Config:
-    project_root: Path = field(default_factory=lambda: Path(__file__).parent.parent)
+    project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
 
     # Paths
     @property
@@ -29,9 +29,7 @@ class Config:
     # Training
     lr: float = 5e-3
     weight_decay: float = 1e-5
-    batch_size: int = 1024
     n_epochs: int = 100
-    num_neighbors: list[int] = field(default_factory=lambda: [25, 10])
 
     # Evaluation
     top_k: list[int] = field(default_factory=lambda: [10, 20])

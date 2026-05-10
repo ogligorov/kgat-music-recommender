@@ -62,10 +62,10 @@ class KGAT(nn.Module):
 
     def get_initial_embeddings(self, data: HeteroData) -> dict[str, torch.Tensor]:
         return {
-            "user": self.user_emb.weight[:data["user"].num_nodes],
-            "artist": self.artist_emb.weight[:data["artist"].num_nodes],
-            "tag": self.tag_emb.weight[:data["tag"].num_nodes],
-            "era": self.era_emb.weight[:data["era"].num_nodes],
+            "user": self.user_emb.weight,
+            "artist": self.artist_emb.weight,
+            "tag": self.tag_emb.weight,
+            "era": self.era_emb.weight,
         }
 
     def forward(self, data: HeteroData) -> dict[str, torch.Tensor]:
@@ -73,7 +73,7 @@ class KGAT(nn.Module):
         edge_index_dict = data.edge_index_dict
 
         # Layer aggregation: sum embeddings from each layer
-        out_dict = {k: v.clone() for k, v in x_dict.items()}
+        out_dict = {k: v for k, v in x_dict.items()}
 
         for conv in self.convs:
             x_dict = conv(x_dict, edge_index_dict)

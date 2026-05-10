@@ -1,6 +1,7 @@
 """Streamlit demo for KGAT Music Recommender."""
 
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,8 @@ def load_model_and_data():
     checkpoint = cfg.processed_data_dir / "kgat_best.pt"
     if checkpoint.exists():
         model.load_state_dict(torch.load(checkpoint, weights_only=True))
+    else:
+        st.warning("No trained checkpoint found. Showing untrained model outputs.")
 
     with open(cfg.processed_data_dir / "id_mappings.json") as f:
         mappings = json.load(f)
@@ -86,7 +89,8 @@ def get_artist_name(mappings, artist_idx):
 
 def get_tag_name(mappings, tag_idx):
     tag_id = mappings.get("idx_to_tag", {}).get(str(tag_idx), "")
-    return f"Tag {tag_id}"
+    name = mappings.get("tag_id_to_name", {}).get(str(tag_id), "")
+    return name if name else f"Tag {tag_id}"
 
 
 def render_explanation_graph(paths, mappings):
@@ -186,10 +190,12 @@ def main():
 
                 # Graph visualization
                 net = render_explanation_graph(paths, mappings)
-                html_path = Path("/tmp/kgat_graph.html")
+                with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
+                    html_path = Path(tmp.name)
                 net.save_graph(str(html_path))
                 with open(html_path) as f:
                     st.components.v1.html(f.read(), height=450)
+                html_path.unlink(missing_ok=True)
             else:
                 st.info("No explanation paths found for this recommendation.")
 

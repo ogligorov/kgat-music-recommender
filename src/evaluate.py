@@ -47,8 +47,7 @@ def evaluate_model(model: KGAT, data: HeteroData, top_k_values: list[int]) -> di
         test_ground_truth.setdefault(uid, set()).add(aid)
 
     # Mask out training items from scores
-    for i in range(train_edges.shape[1]):
-        scores[train_edges[0, i], train_edges[1, i]] = -float("inf")
+    scores[train_edges[0], train_edges[1]] = -float("inf")
 
     max_k = max(top_k_values)
     ndcg_results = {k: [] for k in top_k_values}

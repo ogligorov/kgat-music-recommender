@@ -9,7 +9,6 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
     "requests",
-    "SPARQLWrapper>=2.0",
     "streamlit>=1.30",
     "pyvis>=0.3",
     "networkx>=3.0",

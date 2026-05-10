@@ -1,33 +1,16 @@
 """Explainability: attention path extraction and fidelity testing."""
 
 import json
-from pathlib import Path
 
-import numpy as np
 import torch
-import torch.nn as nn
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import GATConv
 
 from src.model import KGAT
 
 
-def extract_attention_weights(model: KGAT, data: HeteroData) -> dict[tuple, torch.Tensor]:
+def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple, torch.Tensor]]:
     """Run forward pass and capture attention weights from all GATConv layers."""
     model.eval()
-    attention_weights = {}
-
-    # Hook to capture attention weights
-    hooks = []
-
-    def make_hook(layer_idx, edge_type):
-        def hook_fn(module, input, output):
-            # GATConv returns (out, attention_weights) when return_attention_weights=True
-            # But with HeteroConv we need a different approach
-            attention_weights[(layer_idx, edge_type)] = output
-        return hook_fn
-
-    # We need to get attention by setting return_attention_weights temporarily
     x_dict = model.get_initial_embeddings(data)
     edge_index_dict = data.edge_index_dict
 
@@ -36,7 +19,8 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> dict[tuple, torc
     with torch.no_grad():
         for layer_idx, conv in enumerate(model.convs):
             layer_attn = {}
-            # Access each sub-conv and run with return_attention_weights=True
+            out_per_dst: dict[str, list[torch.Tensor]] = {}
+
             for edge_type, subconv in conv.convs.items():
                 src_type, rel_type, dst_type = edge_type
                 edge_index = edge_index_dict[edge_type]
@@ -44,17 +28,22 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> dict[tuple, torc
                 src_x = x_dict[src_type]
                 dst_x = x_dict[dst_type]
 
-                # GATConv forward with attention weights
                 out, (edge_idx, attn) = subconv(
                     (src_x, dst_x), edge_index, return_attention_weights=True
                 )
-                layer_attn[edge_type] = attn.mean(dim=-1)  # Average over heads
+                if attn.dim() == 1:
+                    layer_attn[edge_type] = attn
+                else:
+                    layer_attn[edge_type] = attn.mean(dim=-1)
+                out_per_dst.setdefault(dst_type, []).append(out)
 
             all_layer_attentions.append(layer_attn)
 
-            # Propagate through layer (normal forward)
-            x_dict = conv(x_dict, edge_index_dict)
-            x_dict = {k: torch.relu(v) for k, v in x_dict.items()}
+            # Aggregate outputs per destination type (matches HeteroConv aggr="sum")
+            x_dict = {
+                ntype: torch.relu(torch.stack(outs).sum(dim=0))
+                for ntype, outs in out_per_dst.items()
+            }
 
     return all_layer_attentions
 
@@ -65,12 +54,13 @@ def find_explanation_path(
     user_idx: int,
     artist_idx: int,
     top_k: int = 3,
+    precomputed_attentions: list[dict[tuple, torch.Tensor]] | None = None,
 ) -> list[dict]:
     """Find the top-k attention-weighted paths from user to recommended artist.
 
     Returns paths as list of dicts with nodes and attention scores.
     """
-    all_layer_attentions = extract_attention_weights(model, data)
+    all_layer_attentions = precomputed_attentions or extract_attention_weights(model, data)
 
     paths = []
 
@@ -104,7 +94,7 @@ def find_explanation_path(
             mid_tag_mask = artist_tag_edges[0] == mid_artist.item()
             mid_tags = artist_tag_edges[1, mid_tag_mask]
 
-            shared_tags = set(mid_tags.numpy()) & set(target_tags.numpy())
+            shared_tags = set(mid_tags.cpu().tolist()) & set(target_tags.cpu().tolist())
             for tag_idx in list(shared_tags)[:5]:
                 # Compute path attention as product of edge attentions
                 attn_user_artist = _get_edge_attention(
@@ -165,20 +155,22 @@ def _get_edge_attention(
 
 @torch.no_grad()
 def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100) -> float:
-    """Leave-one-out fidelity: remove top-attention node, check if recommendation changes.
+    """Leave-one-out fidelity: zero top-attention node embedding, re-forward, check score change.
 
-    Returns fidelity score (fraction of cases where removing the explanation node
-    changes the recommendation).
+    Returns fidelity score (fraction of cases where masking the explanation node
+    reduces the recommendation score).
     """
     model.eval()
     out = model(data)
     user_emb = out["user"]
     artist_emb = out["artist"]
 
+    # Precompute attention weights once
+    all_layer_attentions = extract_attention_weights(model, data)
+
     test_mask = data["user", "listens_to", "artist"].test_mask
     test_edges = data["user", "listens_to", "artist"].edge_index[:, test_mask]
 
-    # Sample test interactions
     n_test = test_edges.shape[1]
     sample_indices = torch.randperm(n_test)[:n_samples]
 
@@ -189,39 +181,41 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100) -> float:
         user_idx = test_edges[0, idx].item()
         artist_idx = test_edges[1, idx].item()
 
-        # Original score
         original_score = (user_emb[user_idx] * artist_emb[artist_idx]).sum().item()
 
-        # Find explanation path
-        paths = find_explanation_path(model, data, user_idx, artist_idx, top_k=1)
+        paths = find_explanation_path(
+            model, data, user_idx, artist_idx, top_k=1,
+            precomputed_attentions=all_layer_attentions,
+        )
         if not paths or paths[0]["type"] == "direct":
             continue
 
-        # Get the intermediate node to mask
         path = paths[0]["path"]
-        if len(path) >= 3:
-            # Mask the middle node by zeroing its embedding contribution
-            mid_node_type, mid_node_idx = path[1]
+        if len(path) < 3:
+            continue
 
-            # Re-run with zeroed middle node
-            modified_emb = out[mid_node_type].clone()
-            modified_emb[mid_node_idx] = 0
+        mid_node_type, mid_node_idx = path[1]
 
-            # Recompute user embedding influence (approximate)
-            # For simplicity: check if the artist's rank drops
-            scores = user_emb[user_idx] @ artist_emb.T
-            original_rank = (scores > original_score).sum().item()
+        # Re-forward with zeroed explanation node embedding
+        x_dict_masked = model.get_initial_embeddings(data)
+        x_dict_masked[mid_node_type] = x_dict_masked[mid_node_type].clone()
+        x_dict_masked[mid_node_type][mid_node_idx] = 0.0
 
-            # Zero out the intermediate and see effect
-            scores_modified = scores.clone()
-            if mid_node_type == "artist":
-                scores_modified[mid_node_idx] = -float("inf")
+        out_masked = {k: v.clone() for k, v in x_dict_masked.items()}
+        for conv in model.convs:
+            x_dict_masked = conv(x_dict_masked, data.edge_index_dict)
+            x_dict_masked = {k: torch.relu(v) for k, v in x_dict_masked.items()}
+            for k in out_masked:
+                if k in x_dict_masked:
+                    out_masked[k] = out_masked[k] + x_dict_masked[k]
 
-            new_rank = (scores_modified > scores_modified[artist_idx]).sum().item()
+        masked_score = (
+            out_masked["user"][user_idx] * out_masked["artist"][artist_idx]
+        ).sum().item()
 
-            if new_rank > original_rank:
-                changes += 1
-            total += 1
+        if masked_score < original_score:
+            changes += 1
+        total += 1
 
     return changes / total if total > 0 else 0.0
 
@@ -277,7 +271,8 @@ def main():
                 orig_id = mappings["idx_to_artist"].get(str(node_idx), "?")
                 name = mappings.get("artist_id_to_name", {}).get(str(orig_id), "")
             elif node_type == "tag" and "idx_to_tag" in mappings:
-                name = f"tag_{mappings['idx_to_tag'].get(str(node_idx), '?')}"
+                tag_id = mappings["idx_to_tag"].get(str(node_idx), "?")
+                name = mappings.get("tag_id_to_name", {}).get(str(tag_id), f"tag_{tag_id}")
             print(f"    {node_type}[{node_idx}] {name}")
 
     # Fidelity test

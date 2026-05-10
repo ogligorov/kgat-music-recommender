@@ -1,28 +1,40 @@
-"""Training loop for KGAT with NeighborLoader and BPR loss."""
+"""Training loop for KGAT with BPR loss."""
 
 import time
-from pathlib import Path
 
-import numpy as np
 import torch
-from torch_geometric.loader import NeighborLoader
-from tqdm import tqdm
 
 from src.config import Config
 from src.evaluate import evaluate_model
 from src.model import KGAT
 
 
-def sample_negatives(user_indices: torch.Tensor, n_artists: int, pos_artist_indices: torch.Tensor) -> torch.Tensor:
-    """Sample one negative artist per user (uniform, not in positive set for that user)."""
+def build_user_positive_sets(edge_index: torch.Tensor, n_users: int) -> list[set[int]]:
+    """Build per-user sets of positive artist indices from training edges."""
+    user_positives: list[set[int]] = [set() for _ in range(n_users)]
+    users = edge_index[0].numpy()
+    artists = edge_index[1].numpy()
+    for u, a in zip(users, artists):
+        user_positives[u].add(int(a))
+    return user_positives
+
+
+def sample_negatives(
+    user_indices: torch.Tensor,
+    n_artists: int,
+    user_positives: list[set[int]],
+) -> torch.Tensor:
+    """Sample one negative artist per user, excluding all positives for that user."""
     neg = torch.randint(0, n_artists, (len(user_indices),))
-    # Simple rejection: re-sample collisions (rare given n_artists >> batch)
-    collision = neg == pos_artist_indices
-    neg[collision] = torch.randint(0, n_artists, (collision.sum().item(),))
+    for i in range(len(user_indices)):
+        uid = user_indices[i].item()
+        positives = user_positives[uid]
+        while neg[i].item() in positives:
+            neg[i] = torch.randint(0, n_artists, (1,))
     return neg
 
 
-def train_epoch(model: KGAT, data, optimizer: torch.optim.Optimizer, cfg: Config) -> float:
+def train_epoch(model: KGAT, data, optimizer: torch.optim.Optimizer, cfg: Config, user_positives: list[set[int]]) -> float:
     model.train()
 
     # Full-graph forward pass
@@ -37,7 +49,7 @@ def train_epoch(model: KGAT, data, optimizer: torch.optim.Optimizer, cfg: Config
     # Sample negatives for all training edges
     pos_users = edge_index[0]
     pos_artists = edge_index[1]
-    neg_artists = sample_negatives(pos_users, data["artist"].num_nodes, pos_artists)
+    neg_artists = sample_negatives(pos_users, data["artist"].num_nodes, user_positives)
 
     # BPR loss over all training edges
     loss = model.bpr_loss(
@@ -80,8 +92,13 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    # Pre-build per-user positive sets for negative sampling
+    train_mask = data["user", "listens_to", "artist"].train_mask
+    train_edges = data["user", "listens_to", "artist"].edge_index[:, train_mask]
+    user_positives = build_user_positive_sets(train_edges, data["user"].num_nodes)
+
     best_ndcg = 0.0
-    patience = 10
+    patience = 3
     patience_counter = 0
     checkpoint_path = cfg.processed_data_dir / "kgat_best.pt"
 
@@ -90,7 +107,7 @@ def main():
 
     for epoch in range(1, cfg.n_epochs + 1):
         t0 = time.time()
-        train_loss = train_epoch(model, data, optimizer, cfg)
+        train_loss = train_epoch(model, data, optimizer, cfg, user_positives)
         train_time = time.time() - t0
 
         # Evaluate every 5 epochs
@@ -110,7 +127,7 @@ def main():
                 patience_counter = 0
                 torch.save(model.state_dict(), checkpoint_path)
             else:
-                patience_counter += 5
+                patience_counter += 1
 
             if patience_counter >= patience:
                 print(f"Early stopping at epoch {epoch} (best NDCG@10: {best_ndcg:.4f})")

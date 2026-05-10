@@ -34,6 +34,10 @@ def main():
 
     print("Extracting...")
     with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.namelist():
+            member_path = (cfg.raw_data_dir / member).resolve()
+            if not str(member_path).startswith(str(cfg.raw_data_dir.resolve())):
+                raise ValueError(f"Zip contains path traversal: {member}")
         zf.extractall(cfg.raw_data_dir)
     zip_path.unlink()
 
