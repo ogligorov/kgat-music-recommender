@@ -3,14 +3,21 @@
 Architecture (Wang et al. KDD 2019):
   - Learnable embeddings per node type (user, track, artist, playlist)
   - N layers of HeteroConv wrapping GATConv (relation-aware attention)
-  - Layer aggregation: CONCAT of [x^(0), x^(1), ..., x^(L)] per node, no ReLU
-    between layers and no extra bias toward x^(0). Final per-node embedding
-    has dim (L+1) * embed_dim.
+  - Per-layer ordering after aggregation: message-dropout → L2-normalize.
+    The L2-normalize is what makes the dot-product score scale-invariant
+    across layers (paper kgat_paper.py:289 then :292) — without it, the
+    Xavier-init e^(0) dominates the concat representation. Dropout-then-
+    normalize is the paper's order; reversing it would re-introduce
+    magnitude variance after every dropout mask.
+  - Layer aggregation: CONCAT of [x^(0), x^(1), ..., x^(L)] per node, where
+    x^(0) is UN-normalized (paper line 263) and x^(1..L) are normalized.
+    Final per-node embedding has dim (L+1) * embed_dim.
   - Scoring: dot product of user/track final embeddings.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import GATConv, HeteroConv
 
@@ -34,7 +41,7 @@ class KGAT(nn.Module):
         embed_dim: int = 64,
         n_layers: int = 3,
         n_heads: int = 4,
-        dropout: float = 0.1,
+        mess_dropout: float = 0.1,
     ):
         super().__init__()
         self.n_layers = n_layers
@@ -45,6 +52,12 @@ class KGAT(nn.Module):
         self.track_emb = nn.Embedding(n_tracks, embed_dim)
         self.artist_emb = nn.Embedding(n_artists, embed_dim)
         self.playlist_emb = nn.Embedding(n_playlists, embed_dim)
+
+        # Paper's "message dropout": applied to each layer's aggregated output
+        # BEFORE L2-norm (kgat_paper.py:289). Distinct from GATConv's internal
+        # attention-coefficient dropout (which is also retained, same value,
+        # for Stage A only — Stage B replaces GATConv entirely).
+        self.mess_dropout = nn.Dropout(mess_dropout)
 
         self.convs = nn.ModuleList()
         for _ in range(n_layers):
@@ -58,7 +71,7 @@ class KGAT(nn.Module):
             conv_dict = {
                 edge_type: GATConv(
                     (embed_dim, embed_dim), embed_dim, heads=n_heads, concat=False,
-                    dropout=dropout, add_self_loops=False,
+                    dropout=mess_dropout, add_self_loops=False,
                 )
                 for edge_type in EDGE_TYPES
             }
@@ -97,11 +110,17 @@ class KGAT(nn.Module):
         x_dict = self.get_initial_embeddings(data)
         edge_index_dict = data.edge_index_dict
 
-        # Collect per-layer representations: layer 0 (initial) + each conv output.
+        # Layer 0 (un-normalized; paper line 263) is the base of the concat.
         layer_outputs: dict[str, list[torch.Tensor]] = {k: [v] for k, v in x_dict.items()}
 
         for conv in self.convs:
             x_dict = conv(x_dict, edge_index_dict)
+            # Order matters: dropout BEFORE normalize (paper kgat_paper.py:289
+            # then :292). Reversing would re-scale dropped messages and break
+            # the scale-invariance guarantee L2-norm provides for the concat
+            # representation.
+            x_dict = {k: self.mess_dropout(v) for k, v in x_dict.items()}
+            x_dict = {k: F.normalize(v, p=2, dim=-1) for k, v in x_dict.items()}
             for k in layer_outputs:
                 if k in x_dict:
                     layer_outputs[k].append(x_dict[k])

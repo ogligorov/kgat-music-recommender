@@ -30,10 +30,26 @@ class Config:
     embed_dim: int = 64
     n_layers: int = 3
     n_heads: int = 4
-    dropout: float = 0.1
+    # Per-layer message dropout applied AFTER aggregation, BEFORE L2-normalize
+    # (paper kgat_paper.py:289 then :292). Replaces the prior `dropout` field
+    # which was GATConv internal attention dropout — semantically different
+    # from the paper's "message dropout" and dead once GATConv is dropped in
+    # Stage B.
+    mess_dropout: float = 0.1
+    # Slope for the GCN-aggregator non-linearity (paper default 0.2).
+    leaky_relu_slope: float = 0.2
+    # KGE-side knobs (used only by Stage B; declared here so config is stable
+    # across both stages and Stage B doesn't churn this file again).
+    kge_dim: int = 64
+    kge_reg: float = 1e-5
+    batch_size_kg: int = 2048
 
     # Training
-    lr: float = 5e-3
+    # 10× higher than paper's 1e-4 (deliberate divergence — our graph is
+    # ~17M edges vs the paper's smaller benchmarks, and we want a tractable
+    # wall-clock). Prior value 5e-3 was 50× the paper and overshot the BPR
+    # minimum past epoch ~10 (val NDCG@10 0.487 → 0.45 collapse).
+    lr: float = 1e-3
     weight_decay: float = 1e-5
     n_epochs: int = 100
     batch_size: int = 1048

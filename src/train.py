@@ -214,7 +214,7 @@ def main():
         n_users=n_users, n_tracks=n_tracks,
         n_artists=n_artists, n_playlists=n_playlists,
         embed_dim=cfg.embed_dim, n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads, dropout=cfg.dropout,
+        n_heads=cfg.n_heads, mess_dropout=cfg.mess_dropout,
     ).to(device)
 
     with torch.no_grad():
@@ -228,7 +228,11 @@ def main():
     print(f"Device: {cfg.device}, Layers: {cfg.n_layers}, Embed dim: {cfg.embed_dim}, "
           f"Out dim: {model.out_dim}", flush=True)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # AdamW = Adam with decoupled weight decay (paper's effective regularizer
+    # is L2 on parameters, applied separately from the gradient step). Keeping
+    # `weight_decay` aligned with the paper's `regs[0]=1e-5`. Single optimizer
+    # for both phases — Stage B reuses this when KGE batches are added.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     # Supervision seeds = train edges NOT in the MP graph. By construction these
     # cannot appear as neighbors when sampling around themselves, so the loader

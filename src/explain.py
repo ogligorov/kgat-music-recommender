@@ -325,7 +325,7 @@ def main():
         embed_dim=cfg.embed_dim,
         n_layers=cfg.n_layers,
         n_heads=cfg.n_heads,
-        dropout=cfg.dropout,
+        mess_dropout=cfg.mess_dropout,
     )
 
     # Initialize lazy GATConv params via one tiny sub-graph forward (matches
