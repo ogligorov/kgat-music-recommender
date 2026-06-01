@@ -60,4 +60,8 @@ class Config:
     n_eval_negatives: int = 1000
 
     # Device
-    device: str = field(default_factory=lambda: "mps" if torch.backends.mps.is_available() else "cpu")
+    device: str = field(default_factory=lambda: (
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    ))
