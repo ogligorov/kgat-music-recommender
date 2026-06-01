@@ -383,7 +383,11 @@ def main():
 
     checkpoint = cfg.processed_data_dir / "kgat_best.pt"
     if checkpoint.exists():
-        model.load_state_dict(torch.load(checkpoint, weights_only=True))
+        ckpt = torch.load(checkpoint, weights_only=False)
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+        else:
+            model.load_state_dict(ckpt)
         print(f"Loaded checkpoint from {checkpoint}")
     else:
         print(f"WARNING: no checkpoint at {checkpoint}; attention weights and "

@@ -255,6 +255,17 @@ def train_epoch_kge(
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from data/processed/kgat_best.pt if it exists. Loads model "
+             "weights (and optimizer state + best NDCG + last epoch if the "
+             "checkpoint is in the new dict format).",
+    )
+    args = parser.parse_args()
+
     cfg = Config()
     device = torch.device(cfg.device)
 
@@ -363,7 +374,52 @@ def main():
     best_ndcg = 0.0
     patience = 3
     patience_counter = 0
+    start_epoch = 1
     checkpoint_path = cfg.processed_data_dir / "kgat_best.pt"
+
+    # Resume: model weights always restored; optimizer + best_ndcg + last
+    # epoch only if the checkpoint is the new dict format. Legacy checkpoints
+    # (raw state_dict) load the weights but lose Adam moments and the epoch
+    # counter — we mitigate the dropped best_ndcg below by running an eval
+    # before training starts, so a regressed run won't silently overwrite
+    # the loaded checkpoint.
+    resume_legacy = False
+    if args.resume:
+        if not checkpoint_path.exists():
+            print(f"--resume passed but no checkpoint at {checkpoint_path}; "
+                  f"starting fresh.", flush=True)
+        else:
+            ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                model.load_state_dict(ckpt["model_state_dict"])
+                if "optimizer_state_dict" in ckpt:
+                    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                best_ndcg = ckpt.get("best_ndcg", 0.0)
+                start_epoch = ckpt.get("epoch", 0) + 1
+                print(f"Resumed from {checkpoint_path}: epoch {start_epoch}, "
+                      f"best NDCG@10 so far {best_ndcg:.4f}", flush=True)
+            else:
+                model.load_state_dict(ckpt)
+                resume_legacy = True
+                # Back up the legacy file before the first save can overwrite
+                # it with a possibly-worse dict-format checkpoint.
+                import shutil
+                backup_path = checkpoint_path.with_name(
+                    checkpoint_path.stem + "_legacy_backup.pt"
+                )
+                if not backup_path.exists():
+                    shutil.copy(checkpoint_path, backup_path)
+                    print(f"Backed up legacy checkpoint to {backup_path}", flush=True)
+                print(f"Resumed model weights from {checkpoint_path} "
+                      f"(legacy format — optimizer state and epoch counter "
+                      f"reset; running an eval to seed best_ndcg).",
+                      flush=True)
+                # Seed best_ndcg with the loaded model's actual eval score so
+                # we only overwrite the checkpoint if a future epoch beats it.
+                seed_metrics = evaluate_model(model, data, cfg.top_k, verbose=False)
+                best_ndcg = seed_metrics["ndcg"][10]
+                print(f"  seeded best NDCG@10 = {best_ndcg:.4f} from loaded weights",
+                      flush=True)
 
     print(f"\nTraining for up to {cfg.n_epochs} epochs (patience={patience})...", flush=True)
     print("-" * 60, flush=True)
@@ -371,16 +427,23 @@ def main():
     # Cold-start: W_r and relation_emb are Xavier-init at epoch 1 — attention
     # is near-uniform until KGE has shaped them. One KGE warmup pass before
     # the first CF epoch gives the attention something to differentiate on.
-    print("Stage B warmup: KGE pass before first CF epoch...", flush=True)
-    t0 = time.perf_counter()
-    train_epoch_kge(
-        model, optimizer, kge_triples, type_sizes,
-        batch_size_kg=cfg.batch_size_kg, device=device,
-        epoch_label="warmup ",
-    )
-    print(f"  warmup done in {time.perf_counter() - t0:.1f}s", flush=True)
+    # Skip on resume (either format): the loaded W_r / relation_emb are
+    # already shaped, and a warmup pass at the configured LR would actively
+    # move them away from the trained optimum.
+    if start_epoch == 1 and not args.resume:
+        print("Stage B warmup: KGE pass before first CF epoch...", flush=True)
+        t0 = time.perf_counter()
+        train_epoch_kge(
+            model, optimizer, kge_triples, type_sizes,
+            batch_size_kg=cfg.batch_size_kg, device=device,
+            epoch_label="warmup ",
+        )
+        print(f"  warmup done in {time.perf_counter() - t0:.1f}s", flush=True)
+    elif args.resume:
+        print(f"Resuming{' (legacy)' if resume_legacy else ''}; skipping KGE warmup.",
+              flush=True)
 
-    for epoch in range(1, cfg.n_epochs + 1):
+    for epoch in range(start_epoch, cfg.n_epochs + 1):
         t0 = time.perf_counter()
         cf_loss = train_epoch(
             model, loader, optimizer, device,
@@ -414,7 +477,14 @@ def main():
             if ndcg_10 > best_ndcg:
                 best_ndcg = ndcg_10
                 patience_counter = 0
-                torch.save(model.state_dict(), checkpoint_path)
+                # Dict format so --resume can pick up optimizer state and
+                # epoch counter on the next run.
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_ndcg": best_ndcg,
+                    "epoch": epoch,
+                }, checkpoint_path)
             else:
                 patience_counter += 1
             if patience_counter >= patience:
