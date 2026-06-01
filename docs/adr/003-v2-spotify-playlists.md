@@ -95,8 +95,8 @@ class KGAT(nn.Module):
 
 ### Scale & Training
 
-- ~5–10M edges after filtering → **`NeighborLoader` required** for training; full-graph forward exhausts MPS memory.
-- **Evaluation**: cannot materialize a 15K × 300K score matrix; users scored in batches of 128, top-K extracted per batch.
+- ~5–10M edges after filtering. Start with full-graph propagation (matches v1 and the original KGAT paper, which trains full-graph on Amazon-Book at comparable scale). Fall back to `NeighborLoader` only if MPS OOM hits during training.
+- **Evaluation**: cannot materialize a 15K × 300K score matrix; users scored in batches of 128, top-K extracted per batch. This is independent of the training memory question.
 - **Negative sampling**: random tracks rejected if already in user's positive set.
 
 ---
@@ -146,32 +146,40 @@ Fidelity test: same as v1 — zero out the mid-node embedding, re-run forward, c
 - ~15K users is moderate (~7× larger than v1's 1.9K, within the typical range for academic music-rec benchmarks).
 - String-based dedup leaves some duplicate tracks. Could be improved later with fuzzy matching or Spotify ID resolution.
 
+### Why we don't merge the HetRec or Last.fm_data datasets
+
+The repo also ships `data/raw/*.dat` (HetRec LastFM-2k, v1's source) and `data/Last.fm_data.csv` (a separate single-month scrobble dump). Neither is merged into v2:
+
+- **`Last.fm_data.csv`** has only **11 unique users** (single-month scrobble dump). 76K (artist, track) pairs but mean 1.7 listeners per track — no collaborative signal possible from 11 users. Reject as a user/edge source. Album column would face the same problem.
+- **HetRec users** are a disjoint cohort from Spotify users — can't merge user IDs.
+- **HetRec tags joined onto Spotify artists by lowercased artist name** is the only structurally interesting option. Measured overlap on the full Spotify CSV: HetRec has 17,615 artists (12,127 with ≥1 tag); Spotify has 282,490 unique artists; the tagged-HetRec ∩ Spotify intersection is **9,998 artists = 3.5% of Spotify artists**. Post-K-core the overlap is likely higher (popular artists dominate both datasets), but at 3.5% raw the tag subgraph would be sparse and disconnected for ~96% of artists, biasing tag-mediated propagation toward a small popular subset. Adds an extra node type and two edge types for a noisy partial signal, and dilutes the thesis framing around playlist co-occurrence being **the** new structural signal.
+
+Tag enrichment via HetRec is a viable v3 extension, not a v2 baseline.
+
 ---
 
 ## Implementation Order
 
 1. Tag current `main` as `v1`.
-2. `src/config.py` — drop `dataset_url`; add CSV path, k-core thresholds, `NeighborLoader` config, `n_layers = 3`.
-3. `src/download.py` — manual Kaggle download instructions + presence/row-count validation.
-4. `src/build_graph.py` — full rewrite for the new schema. Reuses existing `split_interactions()` unchanged.
-5. `src/model.py` — new `__init__` signature, 6 edge types, L=3.
-6. `smoke_test.py` — verify forward pass + `NeighborLoader` sample on the new graph.
-7. `src/train.py` — `NeighborLoader`-based BPR loop over `(user, track)` pairs.
-8. `src/evaluate.py` — per-user batched scoring; reuses NDCG/Recall functions unchanged. Cold-user routing to popularity fallback.
-9. `src/baselines.py` — track popularity = unique-user count per track.
-10. `src/explain.py` — new path types (via artist, via playlist); reuse fidelity-test scaffolding.
-11. `app.py` — switch artist picker to track picker; render playlist nodes in explanation graph.
-12. `docs/architecture.md` — update node/edge tables, sequence diagrams, §6.4 V2 description.
+2. `src/config.py` — drop `dataset_url`; add CSV path, k-core thresholds, `eval_user_batch_size`, `n_layers = 3`.
+3. `src/build_graph.py` — full rewrite for the new schema. Reuses existing `split_interactions()` unchanged.
+4. `src/model.py` — new `__init__` signature, 6 edge types, L=3.
+5. `smoke_test.py` — verify forward pass on the new graph; flag if memory pressure suggests `NeighborLoader` is needed.
+6. `src/train.py` — full-graph BPR loop over `(user, track)` pairs (fallback to `NeighborLoader` if OOM).
+7. `src/evaluate.py` — per-user batched scoring; reuses NDCG/Recall functions unchanged. Cold-user routing to popularity fallback.
+8. `src/baselines.py` — track popularity = unique-user count per track.
+9. `src/explain.py` — new path types (via artist, via playlist); reuse fidelity-test scaffolding.
+10. `app.py` — switch artist picker to track picker; render playlist nodes in explanation graph.
+11. `docs/architecture.md` — update node/edge tables, sequence diagrams, §6.4 V2 description.
 
 ---
 
 ## Verification
 
 ```bash
-# Manual: download spotify_dataset.csv to data/raw/ from Kaggle
-python -m src.download              # validates file + row count
+# Manual: download spotify_dataset.csv to data/ from Kaggle
 python -m src.build_graph           # check post-filter counts and split sums
-python smoke_test.py                # KGAT forward + NeighborLoader sample
+python smoke_test.py                # KGAT forward on graph_v2; flags memory pressure
 python -m src.train                 # loss decreases; NDCG@10 beats popularity by epoch ~20
 python -m src.evaluate              # final NDCG@10/20, Recall@10/20
 python -m src.explain --user 0 --track 5
@@ -184,4 +192,4 @@ streamlit run app.py                # demo loads; explanation graph shows
 **Numerical bars** (treat as smoke checks, not targets):
 - KGAT NDCG@10 ≥ track-popularity baseline + 0.02 absolute.
 - Fidelity ≥60% (mid-node masking causes score drop in ≥60% of explained pairs).
-- Training wall-clock <30 min on MPS for 100 epochs with `NeighborLoader`.
+- Training wall-clock <30 min on MPS for 100 epochs.

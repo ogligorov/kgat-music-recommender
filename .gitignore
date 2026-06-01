@@ -11,6 +11,8 @@ dist/
 build/
 .venv/
 
+data/spotify_dataset.csv
+
 # IDE
 .idea/
 .vscode/
