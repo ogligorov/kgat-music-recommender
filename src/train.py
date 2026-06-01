@@ -32,7 +32,7 @@ from torch_geometric.sampler import NegativeSampling
 from src.build_graph import make_train_only_graph
 from src.config import Config
 from src.evaluate import evaluate_model
-from src.model import KGAT
+from src.model import EDGE_TYPES, KGAT
 
 
 def train_epoch(model, loader, optimizer, device, max_batches: int | None = None,
@@ -175,6 +175,85 @@ def disjoint_mp_sup_split(
     return mp_mask, sup_mask
 
 
+def build_kge_triples(data, train_mask: torch.Tensor) -> list[torch.Tensor]:
+    """Per-relation training triples for KGE Phase II.
+
+    Returns a list of length len(EDGE_TYPES); entry r is a [2, E_r] tensor of
+    (h_global, t_pos_global) pairs. For (user, liked, track) and its reverse
+    we use ALL train edges (val/test edges are still excluded). KGE operates
+    on raw embedding tables — no GNN forward — so the supervision-only 30%
+    of train edges that the CF phase reserves for seeds carry no leak risk
+    here, and including them gives W_r[interact] / relation_emb[interact]
+    direct gradient signal on the most important relation.
+
+    Pure-KG relations (track↔artist, track↔playlist) have no train/val/test
+    split — every edge is a training triple.
+    """
+    triples: list[torch.Tensor] = []
+    liked_et = ("user", "liked", "track")
+    rev_liked_et = ("track", "rev_liked", "user")
+    for et in EDGE_TYPES:
+        ei = data[et].edge_index
+        if et == liked_et:
+            ei = ei[:, train_mask]
+        elif et == rev_liked_et:
+            ei = ei[:, train_mask]
+        triples.append(ei.contiguous())
+    return triples
+
+
+def train_epoch_kge(
+    model, optimizer, kge_triples: list[torch.Tensor], type_sizes: dict[str, int],
+    batch_size_kg: int, device, max_batches_per_relation: int | None = None,
+    epoch_label: str = "",
+) -> float:
+    """One full pass over KG triples. Iterates relations sequentially, sampling
+    `batch_size_kg` rows at a time; corrupts the tail uniformly within tail
+    type. Single optimizer step per batch. Returns mean loss across relations,
+    weighted by # of batches per relation."""
+    model.train()
+    total_loss_t = torch.zeros((), device=device)
+    n_batches = 0
+
+    for r_idx, et in enumerate(EDGE_TYPES):
+        s_type, _, d_type = et
+        ei = kge_triples[r_idx]
+        n_edges = ei.shape[1]
+        if n_edges == 0:
+            continue
+        n_t = type_sizes[d_type]
+
+        n_steps = (n_edges + batch_size_kg - 1) // batch_size_kg
+        if max_batches_per_relation is not None:
+            n_steps = min(n_steps, max_batches_per_relation)
+
+        # Permutation per epoch — paper shuffles KG triples each epoch.
+        perm = torch.randperm(n_edges)
+
+        for step in range(n_steps):
+            sl = perm[step * batch_size_kg : (step + 1) * batch_size_kg]
+            h = ei[0, sl].to(device)
+            t_pos = ei[1, sl].to(device)
+            # Uniform tail corruption within the tail type. Paper does NOT
+            # reject collisions with positives — at our scale collisions are
+            # rare enough to be within TransR's robustness.
+            t_neg = torch.randint(0, n_t, (sl.numel(),), device=device)
+
+            loss = model.kge_loss_one_relation(r_idx, h, t_pos, t_neg)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss_t = total_loss_t + loss.detach()
+            n_batches += 1
+
+    if n_batches == 0:
+        return 0.0
+    avg = (total_loss_t / n_batches).item()
+    print(f"  [{epoch_label}KGE] {n_batches} batches | avg loss {avg:.4f}", flush=True)
+    return avg
+
+
 def main():
     cfg = Config()
     device = torch.device(cfg.device)
@@ -214,7 +293,9 @@ def main():
         n_users=n_users, n_tracks=n_tracks,
         n_artists=n_artists, n_playlists=n_playlists,
         embed_dim=cfg.embed_dim, n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads, mess_dropout=cfg.mess_dropout,
+        mess_dropout=cfg.mess_dropout,
+        kge_dim=cfg.kge_dim, kge_reg=cfg.kge_reg,
+        leaky_relu_slope=cfg.leaky_relu_slope,
     ).to(device)
 
     with torch.no_grad():
@@ -265,6 +346,20 @@ def main():
           f"capping to {actual_batches_per_epoch:,} per epoch "
           f"(edges_per_epoch={cfg.edges_per_epoch:,})", flush=True)
 
+    # KGE triple table (Stage B). Built once and held on CPU; per-epoch we
+    # shuffle indices and ship batches to device on demand. Sampling all 6
+    # relations including (user, liked, track) so W_r[interact] and
+    # relation_emb[interact] get direct gradient signal — without it, the
+    # most important relation only updates through CF attention. Uses the
+    # full train_mask (not mp_mask) since KGE is GNN-free and has no leak
+    # risk from supervision-only edges.
+    kge_triples = build_kge_triples(data, train_mask)
+    type_sizes = {"user": n_users, "track": n_tracks,
+                  "artist": n_artists, "playlist": n_playlists}
+    total_kge_edges = sum(t.shape[1] for t in kge_triples)
+    print(f"KGE triples: {total_kge_edges:,} across {len(EDGE_TYPES)} relations "
+          f"(batch_size_kg={cfg.batch_size_kg})", flush=True)
+
     best_ndcg = 0.0
     patience = 3
     patience_counter = 0
@@ -273,14 +368,35 @@ def main():
     print(f"\nTraining for up to {cfg.n_epochs} epochs (patience={patience})...", flush=True)
     print("-" * 60, flush=True)
 
+    # Cold-start: W_r and relation_emb are Xavier-init at epoch 1 — attention
+    # is near-uniform until KGE has shaped them. One KGE warmup pass before
+    # the first CF epoch gives the attention something to differentiate on.
+    print("Stage B warmup: KGE pass before first CF epoch...", flush=True)
+    t0 = time.perf_counter()
+    train_epoch_kge(
+        model, optimizer, kge_triples, type_sizes,
+        batch_size_kg=cfg.batch_size_kg, device=device,
+        epoch_label="warmup ",
+    )
+    print(f"  warmup done in {time.perf_counter() - t0:.1f}s", flush=True)
+
     for epoch in range(1, cfg.n_epochs + 1):
         t0 = time.perf_counter()
-        train_loss = train_epoch(
+        cf_loss = train_epoch(
             model, loader, optimizer, device,
             max_batches=max_batches_per_epoch,
             epoch_label=f"e{epoch} ",
         )
-        train_time = time.perf_counter() - t0
+        cf_time = time.perf_counter() - t0
+
+        t_kge = time.perf_counter()
+        kge_loss = train_epoch_kge(
+            model, optimizer, kge_triples, type_sizes,
+            batch_size_kg=cfg.batch_size_kg, device=device,
+            epoch_label=f"e{epoch} ",
+        )
+        kge_time = time.perf_counter() - t_kge
+        train_time = cf_time + kge_time
 
         if epoch % 5 == 0 or epoch == 1:
             t_eval = time.perf_counter()
@@ -289,9 +405,10 @@ def main():
             ndcg_10 = metrics["ndcg"][10]
             recall_10 = metrics["recall"][10]
             print(
-                f"Epoch {epoch:3d} | Loss: {train_loss:.4f} | "
+                f"Epoch {epoch:3d} | CF: {cf_loss:.4f} | KGE: {kge_loss:.4f} | "
                 f"NDCG@10: {ndcg_10:.4f} | Recall@10: {recall_10:.4f} | "
-                f"Train: {train_time:.1f}s | Eval: {eval_time:.1f}s",
+                f"Train: {train_time:.1f}s (cf {cf_time:.1f} + kge {kge_time:.1f}) | "
+                f"Eval: {eval_time:.1f}s",
                 flush=True,
             )
             if ndcg_10 > best_ndcg:
@@ -305,7 +422,8 @@ def main():
                       flush=True)
                 break
         else:
-            print(f"Epoch {epoch:3d} | Loss: {train_loss:.4f} | Train: {train_time:.1f}s",
+            print(f"Epoch {epoch:3d} | CF: {cf_loss:.4f} | KGE: {kge_loss:.4f} | "
+                  f"Train: {train_time:.1f}s (cf {cf_time:.1f} + kge {kge_time:.1f})",
                   flush=True)
 
     print("-" * 60)

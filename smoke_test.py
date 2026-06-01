@@ -132,7 +132,9 @@ def main():
         n_users=n["user"], n_tracks=n["track"],
         n_artists=n["artist"], n_playlists=n["playlist"],
         embed_dim=cfg.embed_dim, n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads, mess_dropout=cfg.mess_dropout,
+        mess_dropout=cfg.mess_dropout,
+        kge_dim=cfg.kge_dim, kge_reg=cfg.kge_reg,
+        leaky_relu_slope=cfg.leaky_relu_slope,
     ).to(device)
 
     full_graph_ok = try_full_graph_forward(model, data.to(device), device)

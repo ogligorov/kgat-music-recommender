@@ -232,8 +232,10 @@ def main():
         n_playlists=data["playlist"].num_nodes,
         embed_dim=cfg.embed_dim,
         n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads,
         mess_dropout=cfg.mess_dropout,
+        kge_dim=cfg.kge_dim,
+        kge_reg=cfg.kge_reg,
+        leaky_relu_slope=cfg.leaky_relu_slope,
     ).to(device)
 
     # Initialize lazy GATConv params via one tiny sub-graph forward (train-only graph).

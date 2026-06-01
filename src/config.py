@@ -51,7 +51,7 @@ class Config:
     # minimum past epoch ~10 (val NDCG@10 0.487 → 0.45 collapse).
     lr: float = 1e-3
     weight_decay: float = 1e-5
-    n_epochs: int = 100
+    n_epochs: int = 40
     batch_size: int = 1048
     # Per epoch we cap iteration at this many edges (LinkNeighborLoader reshuffles
     # each iter, so each cap is a fresh random subset of train edges). Decouples

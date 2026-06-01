@@ -21,21 +21,24 @@ full graph would let val/test edges leak into the explanations.
 import json
 
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import HeteroData
+from torch_geometric.utils import scatter, softmax
 
 from src.build_graph import make_train_only_graph
-from src.model import KGAT
+from src.model import EDGE_TYPES, KGAT
 
 
 def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple, torch.Tensor]]:
-    """Run a full forward and capture per-layer attention weights, head-averaged
-    and aligned with `data[edge_type].edge_index` (one scalar per edge).
+    """Run a full forward and capture per-layer, per-edge-type attention,
+    aligned with `data[edge_type].edge_index` (one scalar per edge).
 
-    Replicates `model.forward` step-by-step rather than calling it, because PyG
-    only exposes attention through `subconv(..., return_attention_weights=True)`
-    and `HeteroConv` doesn't surface that. The aggregation here MUST match
-    `model.forward`'s behavior (sum across edge types, NO ReLU between layers,
-    consistent with v2's KGAT-paper concat aggregation)."""
+    Replicates `KGAT.forward_one_layer` step by step so we can split the
+    post-softmax attention tensor back per relation. Stage B's softmax
+    denominator runs across ALL incoming relations to a destination
+    (paper kgat_paper.py:384), so the per-relation attention numbers are
+    only meaningful AFTER the joint softmax — we record them here.
+    """
     model.eval()
     x_dict = model.get_initial_embeddings(data)
     edge_index_dict = data.edge_index_dict
@@ -43,31 +46,64 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
     all_layer_attentions: list[dict[tuple, torch.Tensor]] = []
 
     with torch.no_grad():
-        for conv in model.convs:
+        for layer_idx in range(model.n_layers):
+            # Per-destination buffers; track each relation's slice so we can
+            # split the softmax output back.
+            per_dst: dict[str, dict[str, list]] = {
+                nt: {"logits": [], "msgs": [], "dst": [], "rel_slices": []}
+                for nt in x_dict
+            }
+            cursors: dict[str, int] = {nt: 0 for nt in x_dict}
+
+            for r_idx, et in enumerate(EDGE_TYPES):
+                s_type, _, d_type = et
+                ei = edge_index_dict.get(et)
+                if ei is None or ei.numel() == 0:
+                    per_dst[d_type]["rel_slices"].append((et, None))
+                    continue
+                src_local, dst_local = ei[0], ei[1]
+                x_src = x_dict[s_type][src_local]
+                x_dst = x_dict[d_type][dst_local]
+                Wr = model.W_r[r_idx]
+                src_proj = x_src @ Wr
+                dst_proj = x_dst @ Wr
+                r_e = model.relation_emb.weight[r_idx]
+                logit = (src_proj * torch.tanh(dst_proj + r_e)).sum(-1)
+                start = cursors[d_type]
+                end = start + logit.numel()
+                cursors[d_type] = end
+                per_dst[d_type]["logits"].append(logit)
+                per_dst[d_type]["msgs"].append(x_src)
+                per_dst[d_type]["dst"].append(dst_local)
+                per_dst[d_type]["rel_slices"].append((et, (start, end)))
+
             layer_attn: dict[tuple, torch.Tensor] = {}
-            out_per_dst: dict[str, list[torch.Tensor]] = {}
-
-            for edge_type, subconv in conv.convs.items():
-                src_type, _, dst_type = edge_type
-                edge_index = edge_index_dict[edge_type]
-                src_x = x_dict[src_type]
-                dst_x = x_dict[dst_type]
-
-                out, (_, attn) = subconv(
-                    (src_x, dst_x), edge_index, return_attention_weights=True
-                )
-                # Per-head attention → mean over heads to get a single scalar
-                # per edge that we can compare across edge types.
-                layer_attn[edge_type] = attn.mean(dim=-1) if attn.dim() > 1 else attn
-                out_per_dst.setdefault(dst_type, []).append(out)
+            out_dict: dict[str, torch.Tensor] = {}
+            for nt, buf in per_dst.items():
+                n_dst = x_dict[nt].size(0)
+                if not buf["logits"]:
+                    out_dict[nt] = torch.zeros_like(x_dict[nt])
+                    for et, _ in buf["rel_slices"]:
+                        layer_attn[et] = torch.zeros(0)
+                    continue
+                all_logits = torch.cat(buf["logits"], dim=0)
+                all_msgs = torch.cat(buf["msgs"], dim=0)
+                all_dst = torch.cat(buf["dst"], dim=0)
+                attn = softmax(all_logits, all_dst, num_nodes=n_dst)
+                weighted = all_msgs * attn.unsqueeze(-1)
+                out_dict[nt] = scatter(weighted, all_dst, dim=0, dim_size=n_dst, reduce="sum")
+                for et, sl in buf["rel_slices"]:
+                    layer_attn[et] = attn[sl[0]:sl[1]] if sl is not None else torch.zeros(0)
 
             all_layer_attentions.append(layer_attn)
 
-            # HeteroConv aggr="sum" across the edge types incident to each dst.
+            # GCN aggregator + dropout (off in eval) + L2-norm — the same chain
+            # forward() applies, so x_dict matches what the next layer sees.
             x_dict = {
-                ntype: torch.stack(outs).sum(dim=0)
-                for ntype, outs in out_per_dst.items()
+                nt: F.leaky_relu(model.W_gc[layer_idx](v), negative_slope=model.leaky_relu_slope)
+                for nt, v in out_dict.items()
             }
+            x_dict = {k: F.normalize(v, p=2, dim=-1) for k, v in x_dict.items()}
 
     return all_layer_attentions
 
@@ -118,11 +154,14 @@ def find_explanation_path(
     perf = data["track", "performed_by", "artist"].edge_index
     in_pl = data["track", "in_playlist", "playlist"].edge_index
 
-    # 1-hop direct edge.
+    # 1-hop direct edge. Use the same cross-layer mean as via_artist /
+    # via_playlist so direct-path scores are comparable to multi-hop ones.
     direct_mask = (liked[0] == user_idx) & (liked[1] == track_idx)
     if direct_mask.any():
-        edge_idx = direct_mask.nonzero(as_tuple=True)[0][0].item()
-        attn = all_layer_attentions[0][("user", "liked", "track")][edge_idx].item()
+        attn = _get_edge_attention(
+            all_layer_attentions, ("user", "liked", "track"),
+            user_idx, track_idx, data,
+        )
         paths.append({
             "type": "direct",
             "path": [("user", user_idx), ("track", track_idx)],
@@ -256,15 +295,19 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100) -> float:
         mid_node_type, mid_node_idx = path[2]
 
         # Replicate `model.forward` with one row of the hub embedding zeroed.
-        # Must match v2 aggregation exactly: concat of (initial + each layer
-        # output) along feature dim, no ReLU between layers.
+        # Stage B: forward_one_layer → mess_dropout (no-op in eval) → L2-norm,
+        # concat layers including UN-normalized initial. Must match forward()
+        # exactly, otherwise the masked score isn't comparable to `original_score`.
         x_dict = model.get_initial_embeddings(train_data)
         x_dict = {k: v.clone() for k, v in x_dict.items()}
         x_dict[mid_node_type][mid_node_idx] = 0.0
 
         layer_outputs = {k: [v] for k, v in x_dict.items()}
-        for conv in model.convs:
-            x_dict = conv(x_dict, train_data.edge_index_dict)
+        for layer_idx in range(model.n_layers):
+            x_dict = model.forward_one_layer(
+                x_dict, train_data.edge_index_dict, layer_idx,
+            )
+            x_dict = {k: F.normalize(v, p=2, dim=-1) for k, v in x_dict.items()}
             for k in layer_outputs:
                 if k in x_dict:
                     layer_outputs[k].append(x_dict[k])
@@ -324,8 +367,10 @@ def main():
         n_playlists=data["playlist"].num_nodes,
         embed_dim=cfg.embed_dim,
         n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads,
         mess_dropout=cfg.mess_dropout,
+        kge_dim=cfg.kge_dim,
+        kge_reg=cfg.kge_reg,
+        leaky_relu_slope=cfg.leaky_relu_slope,
     )
 
     # Initialize lazy GATConv params via one tiny sub-graph forward (matches
