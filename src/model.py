@@ -1,40 +1,26 @@
 """KGAT model: Knowledge Graph Attention Network for track-level recommendation.
 
-Stage B (paper-faithful): TransR attention + KGE Phase II loss.
-
 Architecture (Wang et al. KDD 2019):
   - Learnable embeddings per node type (user, track, artist, playlist).
   - Per-relation projection `W_r ∈ ℝ^{embed_dim × kge_dim}` and relation
     vector `r ∈ ℝ^{kge_dim}`. EDGE_TYPES indexes the 6 directed relations;
-    forward and reverse get distinct ids (paper treats inverse triples
-    independently).
+    forward and reverse get distinct ids.
   - L custom KGAT layers, each running TransR attention per-relation:
       pi(h, r, t) = (W_r e_t)^T tanh(W_r e_h + e_r)        # paper eq (6)
     where h = ego (PyG dst), t = neighbor (PyG src). The softmax denominator
-    runs over ALL incoming edges to the ego, regardless of relation
-    (paper kgat_paper.py line 384: single sparse N×N softmax). Aggregated
-    message at the ego is the un-projected neighbor embedding e_t.
-  - GCN aggregator (paper alternative; user opted for this variant):
-      e_h^(l) = LeakyReLU(W_gc^(l) · agg(h))               # NO residual
-  - Per-layer ordering after the linear: message-dropout → L2-normalize
-    (paper kgat_paper.py:289 then :292). The L2-norm makes dot-product
-    scoring scale-invariant across layers.
-  - Layer aggregation: CONCAT of [x^(0), x^(1), ..., x^(L)] per node, where
-    x^(0) is UN-normalized (paper line 263) and x^(1..L) are normalized.
-    Final per-node embedding has dim (L+1) * embed_dim.
+    runs over ALL incoming edges to the ego, regardless of relation. The
+    aggregated message is the un-projected neighbor embedding e_t.
+  - GCN aggregator: e_h^(l) = LeakyReLU(W_gc^(l) · agg(h)), no residual.
+  - Per-layer ordering after the linear: message-dropout → L2-normalize.
+    L2-norm makes dot-product scoring scale-invariant across layers.
+  - Layer aggregation: CONCAT of [x^(0), x^(1), ..., x^(L)] per node, with
+    x^(0) un-normalized and x^(1..L) normalized. Final per-node embedding
+    has dim (L+1) * embed_dim.
   - Phase I (CF): BPR over (u, t+, t-) triplets with dot-product score.
   - Phase II (KGE): TransR triplet loss softplus(S_pos - S_neg) with
       S = ||W_r h + r - W_r t||²
     `W_r` and `relation_emb` are SHARED between the two phases — KGE loss
     directly shapes the attention weights used in Phase I.
-
-Plan note. The approved plan's pseudocode had the TransR logit formula
-written as `(t_proj * tanh(h_proj + r))` with `h`=src and `t`=dst, but the
-paper's formula uses `h`=ego and `t`=neighbor. After reconciling against
-paper eq (6) and kgat_paper.py L384, the message direction is: PyG dst is
-the ego, PyG src is the neighbor. The implemented formula below
-`(src_proj * tanh(dst_proj + r))` matches the paper. This is a notational
-fix to the plan, not a deviation from the paper.
 """
 
 import torch
@@ -83,19 +69,15 @@ class KGAT(nn.Module):
         self.playlist_emb = nn.Embedding(n_playlists, embed_dim)
 
         # Per-relation projection W_r ∈ ℝ^{R × D × K} and relation vector r ∈ ℝ^{R × K}.
-        # SHARED across layers (paper has only one trans_W). Initialized with Xavier
-        # uniform — same as the embedding tables.
+        # Shared across layers.
         self.n_relations = len(EDGE_TYPES)
         self.W_r = nn.Parameter(torch.empty(self.n_relations, embed_dim, kge_dim))
         self.relation_emb = nn.Embedding(self.n_relations, kge_dim)
 
-        # Per-layer GCN aggregator weight (paper W_gc^(l)). Bias on (paper line 277
-        # adds bias before LeakyReLU).
+        # Per-layer GCN aggregator weight with bias.
         self.W_gc = nn.ModuleList([nn.Linear(embed_dim, embed_dim) for _ in range(n_layers)])
 
-        # Per-layer message dropout, applied AFTER the GCN linear and BEFORE L2-norm
-        # (paper line 289 then :292). One module — paper uses the same rate at every
-        # layer.
+        # Per-layer message dropout, applied AFTER the GCN linear and BEFORE L2-norm.
         self.mess_dropout = nn.Dropout(mess_dropout)
 
         self._init_weights()
@@ -112,8 +94,8 @@ class KGAT(nn.Module):
             nn.init.zeros_(lin.bias)
 
     def get_initial_embeddings(self, data: HeteroData) -> dict[str, torch.Tensor]:
-        # Sub-graph batches from NeighborLoader carry `n_id` (global IDs of the
-        # sampled nodes); look up embeddings for THOSE rows.
+        # NeighborLoader sub-batches carry `n_id` (global IDs of sampled nodes);
+        # look up embeddings for those rows.
         emb_by_type = {
             "user": self.user_emb,
             "track": self.track_emb,
@@ -141,12 +123,10 @@ class KGAT(nn.Module):
           - logit_e = (W_r · e_src)^T · tanh(W_r · e_dst + e_rel)
           - message_e = e_src (un-projected neighbor embedding)
         Per dst node-type, concat logits/messages/dst-indices across all incoming
-        relations and softmax over dst (paper does ONE softmax per ego across all
-        its incoming edges, regardless of relation). Then scatter-add into the
-        ego, apply GCN aggregator, dropout, L2-norm.
+        relations and softmax over dst (one softmax per ego across all its
+        incoming edges). Then scatter-add into the ego, apply GCN aggregator.
         """
-        # Per-destination buffers: collect (logits, messages, dst_idx) across
-        # every incoming relation for every destination node type.
+        # Per-destination buffers across every incoming relation per dst type.
         per_dst: dict[str, dict[str, list[torch.Tensor]]] = {
             nt: {"logits": [], "msgs": [], "dst": []} for nt in x_dict
         }
@@ -165,23 +145,19 @@ class KGAT(nn.Module):
             dst_proj = x_dst @ Wr                           # W_r · e_h
             r_e = self.relation_emb.weight[r_idx]           # [K]
 
-            # Paper eq (6): pi = (W_r e_t)^T · tanh(W_r e_h + e_r)
+            # paper eq (6): pi = (W_r e_t)^T · tanh(W_r e_h + e_r)
             logit = (src_proj * torch.tanh(dst_proj + r_e)).sum(-1)  # [E_r]
 
             per_dst[d_type]["logits"].append(logit)
-            per_dst[d_type]["msgs"].append(x_src)            # un-projected neighbor (paper line 316)
+            per_dst[d_type]["msgs"].append(x_src)            # un-projected neighbor
             per_dst[d_type]["dst"].append(dst_local)
 
-        # Softmax + scatter-add per destination type. Single softmax across all
-        # incoming relations terminating at each dst node — matches paper's
-        # single sparse-A softmax (kgat_paper.py:384).
+        # Single softmax across all incoming relations terminating at each dst.
         out_dict: dict[str, torch.Tensor] = {}
         for nt, buf in per_dst.items():
             n_dst = x_dict[nt].size(0)
             if not buf["logits"]:
-                # No incoming edges of any relation hit this type in this subgraph.
-                # Pass through zero aggregation; the residual-free GCN aggregator
-                # will then be just LeakyReLU(W_gc @ 0 + b_gc).
+                # No incoming edges of any relation — pass through zero aggregation.
                 out_dict[nt] = torch.zeros_like(x_dict[nt])
                 continue
             all_logits = torch.cat(buf["logits"], dim=0)
@@ -192,7 +168,7 @@ class KGAT(nn.Module):
             weighted = all_msgs * attn.unsqueeze(-1)
             out_dict[nt] = scatter(weighted, all_dst, dim=0, dim_size=n_dst, reduce="sum")
 
-        # GCN aggregator: LeakyReLU(W_gc^(l) · agg). NO residual (paper alternative).
+        # GCN aggregator: LeakyReLU(W_gc^(l) · agg), no residual.
         out_dict = {
             nt: F.leaky_relu(self.W_gc[layer_idx](v), negative_slope=self.leaky_relu_slope)
             for nt, v in out_dict.items()
@@ -203,12 +179,12 @@ class KGAT(nn.Module):
         x_dict = self.get_initial_embeddings(data)
         edge_index_dict = data.edge_index_dict
 
-        # Layer 0 (un-normalized; paper line 263) is the base of the concat.
+        # Layer 0 (un-normalized) is the base of the concat.
         layer_outputs: dict[str, list[torch.Tensor]] = {k: [v] for k, v in x_dict.items()}
 
         for layer_idx in range(self.n_layers):
             x_dict = self.forward_one_layer(x_dict, edge_index_dict, layer_idx)
-            # Order matters: dropout BEFORE normalize (paper line 289 then :292).
+            # Order matters: dropout BEFORE normalize.
             x_dict = {k: self.mess_dropout(v) for k, v in x_dict.items()}
             x_dict = {k: F.normalize(v, p=2, dim=-1) for k, v in x_dict.items()}
             for k in layer_outputs:
@@ -248,8 +224,7 @@ class KGAT(nn.Module):
         t_neg_global: torch.Tensor,
     ) -> torch.Tensor:
         """TransR triplet loss for one relation. Operates on raw embedding
-        tables (no GNN forward) — matches paper's KGE phase, which never
-        runs message passing.
+        tables (no GNN forward).
 
         For relation `r_idx` with EDGE_TYPES[r_idx] = (h_type, _, t_type):
           score(h, t) = ||W_r h + r - W_r t||²
@@ -270,8 +245,8 @@ class KGAT(nn.Module):
 
         s_pos = ((h_proj + r_e - tp_proj) ** 2).sum(dim=-1)
         s_neg = ((h_proj + r_e - tn_proj) ** 2).sum(dim=-1)
-        # Paper: softplus(-(S_neg - S_pos)) = softplus(S_pos - S_neg). We want
-        # the positive triple to score LOWER (smaller distance) than negative.
+        # softplus(S_pos - S_neg): the positive triple should score lower
+        # (smaller distance) than the negative.
         loss = F.softplus(s_pos - s_neg).mean()
 
         reg = (
@@ -284,9 +259,9 @@ class KGAT(nn.Module):
 
 
 if __name__ == "__main__":
-    # Tiny inline check: 1 user, 2 tracks, 1 artist, 1 playlist. Feed a 2-edge
-    # subgraph and verify (a) shapes are right, (b) attention coefficients sum
-    # to 1 per destination, (c) KGE loss on random init ~ softplus(0) = ln 2.
+    # Tiny inline check: 1 user, 2 tracks, 1 artist, 1 playlist. Verify shapes,
+    # attention coefficients sum to 1 per destination, and KGE loss on random
+    # init ~ softplus(0) = ln 2.
     from torch_geometric.data import HeteroData
 
     torch.manual_seed(0)

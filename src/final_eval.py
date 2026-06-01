@@ -1,12 +1,9 @@
 """Final evaluation: load the trained KGAT, score it on the chosen split with
-larger sampled-eval sizes than the training-time eval, and run the popularity
-baseline through the same protocol for a side-by-side comparison.
+larger sampled-eval sizes, and run the popularity baseline through the same
+protocol for a side-by-side comparison.
 
-Default settings (val / test, n_eval_users=2000, n_eval_negatives=5000) are
-calibrated for thesis-quality numbers — confidence is much tighter than the
-training-time 500/1000 used for early stopping. Both KGAT and baseline use
-the SAME seed, eligible-user sample, and per-user candidate sets, so the
-deltas are apples-to-apples.
+Both KGAT and baseline use the SAME seed, eligible-user sample, and per-user
+candidate sets, so the deltas are apples-to-apples.
 
 Usage:
   .venv/bin/python -m src.final_eval --split test
@@ -27,8 +24,7 @@ from src.model import KGAT
 
 
 def load_trained_model(cfg: Config, data, device: torch.device) -> KGAT:
-    """Construct KGAT, run a tiny init forward (matches the pattern in
-    train.py / evaluate.py), then load weights from kgat_best.pt."""
+    """Construct KGAT, run a tiny init forward, then load weights from kgat_best.pt."""
     model = KGAT(
         n_users=data["user"].num_nodes,
         n_tracks=data["track"].num_nodes,
@@ -106,8 +102,7 @@ def main():
     args = parser.parse_args()
 
     cfg = Config()
-    # Override only the two sampling knobs; everything else (top_k, num_neighbors,
-    # batch sizes) stays as configured.
+    # Override only the two sampling knobs.
     cfg.n_eval_users = args.n_users
     cfg.n_eval_negatives = args.n_negatives
     device = torch.device(cfg.device)

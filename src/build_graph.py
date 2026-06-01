@@ -151,7 +151,7 @@ def build_edge_indices(df: pd.DataFrame, mappings: dict) -> dict:
 def split_interactions(
     edge_index: torch.Tensor, n_users: int, val_ratio: float = 0.1, test_ratio: float = 0.1
 ) -> dict[str, torch.Tensor]:
-    """Per-user 80/10/10 random split. Carries forward unchanged from v1."""
+    """Per-user 80/10/10 random split."""
     rng = np.random.default_rng(42)
     train_mask = torch.ones(edge_index.shape[1], dtype=torch.bool)
     val_mask = torch.zeros(edge_index.shape[1], dtype=torch.bool)
@@ -181,20 +181,15 @@ def make_train_only_graph(
     edge_indices are filtered to a chosen subset. All other edge types and node
     counts are shared by reference.
 
-    This is required because PyG's `train_mask` is metadata: it is NOT applied
-    automatically during message passing. Forwarding `data` directly leaks val/test
-    labels into the GNN, contaminating both training (model sees the answer) and
-    evaluation (embeddings encode the held-out edges).
+    PyG's `train_mask` is metadata: it is NOT applied automatically during
+    message passing. Forwarding `data` directly leaks val/test labels into
+    the GNN.
 
     `mp_mask` controls which edges survive into the message-passing graph:
-      - None (default): use `train_mask`. Correct for evaluation, where every
-        train edge should inform the model's view of users/tracks.
+      - None (default): use `train_mask`. Correct for evaluation.
       - Custom bool mask of length |liked edges|: use during supervised training
         to disjoint-split train edges into a message-passing pool (mp_mask=True)
-        and a supervision pool (mp_mask=False, fed as edge_label_index). Without
-        this disjoint split, LinkNeighborLoader leaves the supervision edge in
-        the MP graph for its own batch and the model trivially copies the
-        positive track's embedding into the user node before scoring it.
+        and a supervision pool (mp_mask=False, fed as edge_label_index).
     """
     if mp_mask is None:
         mp_mask = data["user", "liked", "track"].train_mask

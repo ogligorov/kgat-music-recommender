@@ -1,14 +1,14 @@
-"""Streamlit demo for the v2 KGAT music recommender.
+"""Streamlit demo for the KGAT music recommender.
 
-Lives on top of the trained KGAT (4 node types: user/track/artist/playlist;
-6 directed relations; TransR attention) and the popularity baseline. Picks
-a user, shows KGAT top-K tracks vs. popularity top-K, and lets the user
-inspect explanation paths (direct / via_artist / via_playlist) for any
-recommended track.
+Loads the trained KGAT (4 node types: user/track/artist/playlist; 6 directed
+relations; TransR attention) and the popularity baseline. Picks a user,
+shows KGAT top-K tracks vs. popularity top-K, and lets the user inspect
+explanation paths (direct / via_artist / via_playlist) for any recommended
+track.
 
-Embedding the full corpus (14k users × 381k tracks) once at startup is the
-slow part — wrapped in @st.cache_resource so it pays the cost a single time
-per process. Per-user scoring after that is a single matmul.
+Embedding the full corpus (14k users × 381k tracks) is wrapped in
+@st.cache_resource so it runs once per process. Per-user scoring after
+that is a single matmul.
 """
 
 import json
@@ -24,19 +24,19 @@ from src.baselines import score_cold_user
 from src.build_graph import make_train_only_graph
 from src.config import Config
 from src.evaluate import compute_final_embeddings
-from src.explain import find_explanation_path
+from src.explain import extract_attention_weights, find_explanation_path
 from src.model import KGAT
 
 
 @st.cache_resource(show_spinner="Loading graph + model + embeddings (one-time, ~1 min)...")
 def load_everything():
     cfg = Config()
-    # Streamlit + MPS NeighborLoader incompatibility (aten::_convert_indices_from_coo_to_csr
-    # missing on MPS), so demo runs on CPU/CUDA only — auto-pick.
+    # MPS lacks aten::_convert_indices_from_coo_to_csr, which PyG NeighborLoader needs.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     data = torch.load(cfg.processed_data_dir / "graph.pt", weights_only=False)
     train_data = make_train_only_graph(data)
+    train_data_dev = train_data.to(device)
 
     model = KGAT(
         n_users=data["user"].num_nodes,
@@ -68,8 +68,7 @@ def load_everything():
         model.load_state_dict(ckpt)
     model.eval()
 
-    # Embed every user and every track once. compute_final_embeddings returns
-    # CPU tensors; we keep them there for the matmul.
+    # Embed every user and every track once; CPU tensors for the matmul.
     n_users = data["user"].num_nodes
     n_tracks = data["track"].num_nodes
     user_emb = compute_final_embeddings(
@@ -81,12 +80,11 @@ def load_everything():
         input_nodes=torch.arange(n_tracks),
     )
 
-    # Popularity vector (train edges only — eval/test are held out).
+    # Popularity vector over train edges only.
     liked = data["user", "liked", "track"]
     train_edges = liked.edge_index[:, liked.train_mask]
     track_pop = torch.bincount(train_edges[1], minlength=n_tracks).float()
 
-    # Per-user train positives for score masking.
     train_pos_per_user: list[set[int]] = [set() for _ in range(n_users)]
     for u, t in zip(train_edges[0].tolist(), train_edges[1].tolist()):
         train_pos_per_user[u].add(t)
@@ -98,10 +96,15 @@ def load_everything():
         for nt in ("user", "track", "artist", "playlist")
     }
 
+    # Pre-compute attentions once; reused on every selectbox change.
+    with torch.no_grad():
+        attentions = extract_attention_weights(model, train_data_dev)
+
     return {
         "cfg": cfg,
         "data": data,
         "train_data": train_data,
+        "train_data_dev": train_data_dev,
         "model": model,
         "user_emb": user_emb,
         "track_emb": track_emb,
@@ -109,6 +112,7 @@ def load_everything():
         "train_pos_per_user": train_pos_per_user,
         "mappings": mappings,
         "idx_to_key": idx_to_key,
+        "attentions": attentions,
         "device": device,
     }
 
@@ -196,7 +200,7 @@ def render_explanation_graph(paths: list[dict], mappings: dict, idx_to_key: dict
 def main():
     st.set_page_config(page_title="KGAT Music Recommender", layout="wide")
     st.title("KGAT Music Recommender")
-    st.caption("v2 4-node KG (user / track / artist / playlist) — TransR attention")
+    st.caption("4-node KG (user / track / artist / playlist) — TransR attention")
 
     state = load_everything()
     n_users = state["data"]["user"].num_nodes
@@ -248,8 +252,9 @@ def main():
         return
 
     paths = find_explanation_path(
-        state["model"], state["train_data"].to(state["device"]),
+        state["model"], state["train_data_dev"],
         int(user_idx), int(selected), top_k=5,
+        precomputed_attentions=state["attentions"],
     )
     if not paths:
         st.info(

@@ -1,19 +1,16 @@
 """Evaluation metrics: NDCG@K and Recall@K for track-level recommendation.
 
-Sampled-metrics design (chosen to fit the 30-min wall-clock budget):
+Sampled-metrics protocol:
   - Each eval pass scores `cfg.n_eval_users` randomly sampled users with
     >=1 eval positive against a PER-USER candidate set:
         (user's eval positives) ∪ (shared neg_pool \\ user's train positives \\ user's eval positives)
     The shared neg_pool is `cfg.n_eval_negatives` random tracks. Each user is
     ranked only over their own candidate set, so other users' positives never
-    appear as "negatives" for them. This matches BPR/NCF/LightGCN sampled-eval.
+    appear as "negatives" for them.
   - Final embeddings are computed over the UNION of candidate tracks via a
     single NeighborLoader pass; per-user ranking gathers from that pool.
   - Message passing uses a train-only graph copy so val/test edges never
     contaminate the GNN's view of the user/track nodes.
-  - Absolute numbers are not comparable to full-corpus eval, but trends and
-    rank-ordering between models are preserved — which is what we need for
-    early stopping and for comparing KGAT to the popularity baseline.
 """
 
 import time
@@ -100,10 +97,10 @@ def evaluate_model(
     verbose: bool = True,
     cfg: Config | None = None,
 ) -> dict:
-    """Sampled-metrics NDCG@K and Recall@K. See module docstring for design.
+    """Sampled-metrics NDCG@K and Recall@K.
 
     Pass `cfg` to override n_eval_users / n_eval_negatives without mutating
-    the global default — used by final_eval.py for tighter thesis numbers.
+    the global default.
     """
     assert split in ("val", "test"), f"split must be 'val' or 'test', got {split!r}"
 
@@ -113,10 +110,9 @@ def evaluate_model(
     was_training = model.training
     model.eval()
     rng = np.random.default_rng(seed)
-    # PyG's NeighborLoader uses the torch global RNG for neighbor sampling, so
-    # without this two runs with the same `seed` produce different embeddings
-    # and different NDCG. Seed both numpy (for user/neg_pool sampling) and
-    # torch (for sampler) for end-to-end reproducibility.
+    # PyG's NeighborLoader uses the torch global RNG for neighbor sampling.
+    # Seed both numpy (user / neg_pool sampling) and torch (sampler) for
+    # end-to-end reproducibility.
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -253,7 +249,7 @@ def main():
         leaky_relu_slope=cfg.leaky_relu_slope,
     ).to(device)
 
-    # Initialize lazy GATConv params via one tiny sub-graph forward (train-only graph).
+    # Initialize lazy params via one tiny sub-graph forward (train-only graph).
     train_data = make_train_only_graph(data)
     init_loader = NeighborLoader(
         train_data, num_neighbors=[5, 5, 5], input_nodes="user", batch_size=8,

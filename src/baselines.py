@@ -24,8 +24,7 @@ def track_popularity_baseline(
     """Score each user by global track popularity (likers per track) under the
     same per-user-candidate sampled-metrics protocol as evaluate_model.
 
-    Pass `cfg` to override n_eval_users / n_eval_negatives — final_eval.py
-    uses this to match its KGAT eval one-to-one on user/candidate counts.
+    Pass `cfg` to override n_eval_users / n_eval_negatives.
     """
     assert split in ("val", "test")
     if cfg is None:
@@ -40,7 +39,6 @@ def track_popularity_baseline(
     eval_mask = liked.val_mask if split == "val" else liked.test_mask
     eval_edges = liked.edge_index[:, eval_mask]
 
-    # Track popularity = distinct likers per track (train edges already deduped).
     track_pop = torch.bincount(train_edges[1], minlength=n_tracks).float()
 
     train_pos_per_user: list[set[int]] = [set() for _ in range(n_users)]
@@ -68,13 +66,9 @@ def track_popularity_baseline(
     for uid in eligible_list:
         gt = eval_gt_per_user[uid]
         train_pos = train_pos_per_user[uid]
-        # Per-user candidate set, identical construction to evaluate.py.
         cand = (neg_pool_set - train_pos - gt) | gt
         cand_tensor = torch.tensor(sorted(cand), dtype=torch.long)
-        # Popularity has heavy ties (long tail). torch.topk on ties isn't stable
-        # and `sorted(cand)` orders by track_id, which would deterministically
-        # advantage/disadvantage GT tracks based on id. Add tiny seeded jitter
-        # so ties break uniformly. Magnitude << 1 so it can't flip non-ties.
+        # Seeded jitter (<<1) breaks popularity ties uniformly.
         jitter = torch.from_numpy(rng.uniform(0, 1e-6, size=cand_tensor.numel())).float()
         scores = track_pop[cand_tensor] + jitter
 

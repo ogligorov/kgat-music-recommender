@@ -1,4 +1,4 @@
-"""Explainability for the v2 4-node KG (user / track / artist / playlist).
+"""Explainability for the 4-node KG (user / track / artist / playlist).
 
 Two responsibilities:
   - `find_explanation_path` extracts top-k attention-weighted paths from a
@@ -14,8 +14,7 @@ Two responsibilities:
     and re-forwards. Reports the fraction of test pairs where the score drops.
 
 All forwards run on the train-only graph (`make_train_only_graph`) to match
-the message-passing the model actually saw at training time. Running on the
-full graph would let val/test edges leak into the explanations.
+the message-passing the model actually saw at training time.
 """
 
 import json
@@ -34,10 +33,9 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
     aligned with `data[edge_type].edge_index` (one scalar per edge).
 
     Replicates `KGAT.forward_one_layer` step by step so we can split the
-    post-softmax attention tensor back per relation. Stage B's softmax
-    denominator runs across ALL incoming relations to a destination
-    (paper kgat_paper.py:384), so the per-relation attention numbers are
-    only meaningful AFTER the joint softmax — we record them here.
+    post-softmax attention tensor back per relation. The softmax denominator
+    runs across all incoming relations to a destination, so per-relation
+    attention numbers are only meaningful AFTER the joint softmax.
     """
     model.eval()
     x_dict = model.get_initial_embeddings(data)
@@ -306,9 +304,8 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
         mid_node_type, mid_node_idx = path[2]
 
         # Replicate `model.forward` with one row of the hub embedding zeroed.
-        # Stage B: forward_one_layer → mess_dropout (no-op in eval) → L2-norm,
-        # concat layers including UN-normalized initial. Must match forward()
-        # exactly, otherwise the masked score isn't comparable to `original_score`.
+        # forward_one_layer → mess_dropout (no-op in eval) → L2-norm, concat
+        # layers including UN-normalized initial. Must match forward() exactly.
         x_dict = model.get_initial_embeddings(train_data)
         x_dict = {k: v.clone() for k, v in x_dict.items()}
         x_dict[mid_node_type][mid_node_idx] = 0.0
@@ -388,10 +385,9 @@ def main():
         leaky_relu_slope=cfg.leaky_relu_slope,
     ).to(device)
 
-    # Initialize lazy GATConv params via one tiny sub-graph forward (matches
-    # the pattern in evaluate.py / train.py). NeighborLoader requires CPU
-    # tensors (MPS lacks CSR conversion), so we sample on CPU and move the
-    # batch to device.
+    # Initialize lazy params via one tiny sub-graph forward. NeighborLoader
+    # requires CPU tensors (MPS lacks CSR conversion), so we sample on CPU
+    # and move the batch to device.
     init_loader = NeighborLoader(
         train_data, num_neighbors=[3, 3, 3], input_nodes="user", batch_size=8,
     )

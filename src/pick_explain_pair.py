@@ -89,7 +89,7 @@ def main():
     for t, p in zip(in_pl[0].tolist(), in_pl[1].tolist()):
         track_to_playlists.setdefault(t, set()).add(p)
 
-    # Embed all users + all tracks once via the train-only graph. ~30s on a 5070.
+    # Embed all users + all tracks once via the train-only graph.
     print("Computing user embeddings...")
     user_emb = compute_final_embeddings(
         model, train_data, "user", cfg, device,
@@ -127,8 +127,8 @@ def main():
             target_pls = track_to_playlists.get(target, set())
             if artist is None or not target_pls:
                 continue
-            # Cap to first 50 likes (matches evaluate.py's max_user_tracks) so
-            # power users with hundreds of likes don't blow up the hub scan.
+            # Cap to first 50 likes so power users with hundreds of likes
+            # don't blow up the hub scan.
             user_liked_tracks = sorted(tr_pos)[:50]
             shares_artist = any(
                 track_to_artist.get(t) == artist
