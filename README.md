@@ -8,8 +8,6 @@ types. Design rationale: `docs/adr/003-v2-spotify-playlists.md`. Architecture:
 ## Setup
 
 ```bash
-git clone -b feat/implement-playlists-linking <repo-url>
-cd music_recommender
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 # CPU / MPS (Apple Silicon)
