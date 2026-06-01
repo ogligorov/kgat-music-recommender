@@ -252,14 +252,24 @@ def find_explanation_path(
 
 
 @torch.no_grad()
-def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100) -> float:
+def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
+                  seed: int = 42) -> tuple[float, float]:
     """For sampled (user, target_track) test edges, find the top explanation
     path; if it's via_artist or via_playlist, zero the hub node's initial
     embedding and re-forward. Fidelity = fraction of samples where the
     masked score is lower than the original. `data` is the FULL graph (we
-    need test_mask); message passing happens on the train-only graph."""
+    need test_mask); message passing happens on the train-only graph.
+
+    Returns (fidelity, coverage):
+      fidelity = changes / total
+      coverage = total / n_samples — fraction of sampled pairs whose top-1
+                 explanation was a non-direct path (only those are testable
+                 by hub-masking). Reporting both lets the thesis distinguish
+                 'masking does change the score' from 'we can't even mask'.
+    """
     model.eval()
-    train_data = make_train_only_graph(data)
+    device = next(model.parameters()).device
+    train_data = make_train_only_graph(data).to(device)
 
     out = model(train_data)
     user_emb = out["user"]
@@ -270,7 +280,8 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100) -> float:
     test_mask = data["user", "liked", "track"].test_mask
     test_edges = data["user", "liked", "track"].edge_index[:, test_mask]
     n_test = test_edges.shape[1]
-    sample_indices = torch.randperm(n_test)[: min(n_samples, n_test)]
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    sample_indices = torch.randperm(n_test, generator=gen)[: min(n_samples, n_test)]
 
     changes = 0
     total = 0
@@ -319,7 +330,10 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100) -> float:
             changes += 1
         total += 1
 
-    return changes / total if total > 0 else 0.0
+    n_attempted = len(sample_indices)
+    fidelity = changes / total if total > 0 else 0.0
+    coverage = total / n_attempted if n_attempted > 0 else 0.0
+    return fidelity, coverage
 
 
 def _label_for(node_type: str, node_idx: int, mappings: dict, idx_to_key: dict) -> str:
@@ -355,6 +369,7 @@ def main():
     from src.config import Config
 
     cfg = Config()
+    device = torch.device(cfg.device)
 
     print(f"Loading graph from {cfg.processed_data_dir / 'graph.pt'}...")
     data = torch.load(cfg.processed_data_dir / "graph.pt", weights_only=False)
@@ -371,19 +386,25 @@ def main():
         kge_dim=cfg.kge_dim,
         kge_reg=cfg.kge_reg,
         leaky_relu_slope=cfg.leaky_relu_slope,
-    )
+    ).to(device)
 
     # Initialize lazy GATConv params via one tiny sub-graph forward (matches
-    # the pattern in evaluate.py / train.py).
+    # the pattern in evaluate.py / train.py). NeighborLoader requires CPU
+    # tensors (MPS lacks CSR conversion), so we sample on CPU and move the
+    # batch to device.
     init_loader = NeighborLoader(
         train_data, num_neighbors=[3, 3, 3], input_nodes="user", batch_size=8,
     )
     with torch.no_grad():
-        model(next(iter(init_loader)))
+        model(next(iter(init_loader)).to(device))
+
+    # Move the train-only graph to device for find_explanation_path /
+    # fidelity_test forwards.
+    train_data = train_data.to(device)
 
     checkpoint = cfg.processed_data_dir / "kgat_best.pt"
     if checkpoint.exists():
-        ckpt = torch.load(checkpoint, weights_only=False)
+        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             model.load_state_dict(ckpt["model_state_dict"])
         else:
@@ -418,8 +439,12 @@ def main():
             print(f"    {node_type}[{node_idx}] {label}")
 
     print(f"\nRunning fidelity test ({args.fidelity_samples} samples)...")
-    fidelity = fidelity_test(model, data, n_samples=args.fidelity_samples)
-    print(f"Fidelity score: {fidelity:.4f}")
+    fidelity, coverage = fidelity_test(model, data, n_samples=args.fidelity_samples)
+    print(f"Fidelity score: {fidelity:.4f} (coverage: {coverage:.2%})")
+    print("  fidelity   = fraction of testable samples where masking the hub "
+          "node lowered the score")
+    print("  coverage   = fraction of sampled test edges whose top-1 explanation "
+          "was multi-hop (only those are testable; direct paths are skipped)")
 
 
 if __name__ == "__main__":

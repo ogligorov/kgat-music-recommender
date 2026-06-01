@@ -19,11 +19,17 @@ def track_popularity_baseline(
     top_k_values: list[int],
     split: str = "val",
     seed: int = 42,
+    cfg: Config | None = None,
 ) -> dict:
     """Score each user by global track popularity (likers per track) under the
-    same per-user-candidate sampled-metrics protocol as evaluate_model."""
+    same per-user-candidate sampled-metrics protocol as evaluate_model.
+
+    Pass `cfg` to override n_eval_users / n_eval_negatives — final_eval.py
+    uses this to match its KGAT eval one-to-one on user/candidate counts.
+    """
     assert split in ("val", "test")
-    cfg = Config()
+    if cfg is None:
+        cfg = Config()
     rng = np.random.default_rng(seed)
 
     n_users = data["user"].num_nodes
@@ -52,7 +58,7 @@ def track_popularity_baseline(
     eligible.sort()
     eligible_list = eligible.tolist()
 
-    neg_pool = rng.choice(n_tracks, size=cfg.n_eval_negatives, replace=False)
+    neg_pool = rng.choice(n_tracks, size=min(cfg.n_eval_negatives, n_tracks), replace=False)
     neg_pool_set: set[int] = {int(t) for t in neg_pool}
 
     max_k = max(top_k_values)
@@ -65,7 +71,12 @@ def track_popularity_baseline(
         # Per-user candidate set, identical construction to evaluate.py.
         cand = (neg_pool_set - train_pos - gt) | gt
         cand_tensor = torch.tensor(sorted(cand), dtype=torch.long)
-        scores = track_pop[cand_tensor]
+        # Popularity has heavy ties (long tail). torch.topk on ties isn't stable
+        # and `sorted(cand)` orders by track_id, which would deterministically
+        # advantage/disadvantage GT tracks based on id. Add tiny seeded jitter
+        # so ties break uniformly. Magnitude << 1 so it can't flip non-ties.
+        jitter = torch.from_numpy(rng.uniform(0, 1e-6, size=cand_tensor.numel())).float()
+        scores = track_pop[cand_tensor] + jitter
 
         k_actual = min(max_k, scores.numel())
         top_idx = torch.topk(scores, k_actual).indices

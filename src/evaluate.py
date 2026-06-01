@@ -98,15 +98,28 @@ def evaluate_model(
     split: str = "val",
     seed: int = 42,
     verbose: bool = True,
+    cfg: Config | None = None,
 ) -> dict:
-    """Sampled-metrics NDCG@K and Recall@K. See module docstring for design."""
+    """Sampled-metrics NDCG@K and Recall@K. See module docstring for design.
+
+    Pass `cfg` to override n_eval_users / n_eval_negatives without mutating
+    the global default — used by final_eval.py for tighter thesis numbers.
+    """
     assert split in ("val", "test"), f"split must be 'val' or 'test', got {split!r}"
 
-    cfg = Config()
+    if cfg is None:
+        cfg = Config()
     device = next(model.parameters()).device
     was_training = model.training
     model.eval()
     rng = np.random.default_rng(seed)
+    # PyG's NeighborLoader uses the torch global RNG for neighbor sampling, so
+    # without this two runs with the same `seed` produce different embeddings
+    # and different NDCG. Seed both numpy (for user/neg_pool sampling) and
+    # torch (for sampler) for end-to-end reproducibility.
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     timings: dict[str, float] = {}
 
@@ -141,7 +154,9 @@ def evaluate_model(
     eligible_list = eligible.tolist()
 
     # Shared neg_pool. Per-user candidate = (gt_u) ∪ (neg_pool \ train_pos_u \ gt_u).
-    neg_pool = rng.choice(n_tracks, size=cfg.n_eval_negatives, replace=False)
+    # Clamp to n_tracks so rng.choice(replace=False) doesn't raise on small datasets.
+    neg_pool_size = min(cfg.n_eval_negatives, n_tracks)
+    neg_pool = rng.choice(n_tracks, size=neg_pool_size, replace=False)
     neg_pool_set: set[int] = {int(t) for t in neg_pool}
 
     # Embedding pool = union of every user's candidate set = neg_pool ∪ all eligible gt.

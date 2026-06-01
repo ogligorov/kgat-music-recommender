@@ -1,120 +1,97 @@
-# Music Recommender (KGAT, v2)
+# Music Recommender — KGAT
 
-Track-level music recommendation using a Knowledge Graph Attention Network on the
-Spotify Playlists dataset. 4 node types (user, track, artist, playlist) and 6 edge
-types. Design rationale: `docs/adr/003-v2-spotify-playlists.md`. Architecture:
-`docs/architecture.md`.
+Paper-faithful **Knowledge Graph Attention Network** (Wang et al., KDD 2019) for
+explainable track-level recommendation on the
+[Spotify Playlists dataset](https://www.kaggle.com/datasets/andrewmvd/spotify-playlists).
+
+Heterogeneous graph: 4 node types (`user`, `track`, `artist`, `playlist`) and 6
+directed relations. TransR attention + KGE Phase II loss + GCN aggregator. BPR
+on `(user, liked, track)`.
+
+Architecture: `docs/architecture.md`. Project map and key decisions: `CLAUDE.md`.
 
 ## Setup
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-
-# CPU / MPS (Apple Silicon)
-pip install torch
-# CUDA 12.8 (e.g. RTX 40/50 series). Use the nightly index if your GPU is
-# newer than the latest stable wheel:
-# pip install torch --index-url https://download.pytorch.org/whl/cu128
-
-pip install torch_geometric pandas numpy
+python -m venv .venv && source .venv/bin/activate
+pip install torch                                    # CPU / MPS
+# CUDA wheels: pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install -e .
+# PyG sampler backend (match your torch + CUDA build):
+# pip install pyg-lib torch-sparse -f https://data.pyg.org/whl/torch-<X.Y.Z>+<cpu|cuXXX>.html
 ```
 
 `src/config.py` auto-detects `cuda` → `mps` → `cpu`.
 
 ## Data
 
-The raw CSV (`data/spotify_dataset.csv`, ~1.1 GB) is gitignored. Download it once
-into `data/`. The processed graph (`data/processed/graph.pt`, `id_mappings.json`)
-is built from the CSV — either rebuild on the training machine or copy the
-processed files across.
+Place the raw CSV at `data/spotify_dataset.csv` (~1.1 GB, gitignored). Processed
+artifacts (`data/processed/graph.pt`, `id_mappings.json`, `kgat_best.pt`) are
+also gitignored — rebuild them on each machine, or copy the processed files.
 
-## Pipeline
+## Workflow
 
 Run from the repo root.
 
-### 1. Build the graph
-
 ```bash
+# 1. Build the heterogeneous graph from the CSV (5-core filter, 80/10/10 split).
 python -m src.build_graph
-```
 
-Reads `data/spotify_dataset.csv`, applies a 5-core filter (configurable in
-`src/config.py`), builds the heterogeneous graph, and writes:
-
-- `data/processed/graph.pt` — PyG `HeteroData` with train/val/test masks on
-  `(user, liked, track)` edges (per-user 80/10/10 split).
-- `data/processed/id_mappings.json` — global ID ↔ index mappings.
-
-### 2. Smoke test
-
-```bash
+# 2. Smoke test (forward pass on a tiny subgraph).
 python smoke_test.py
+
+# 3. Train. AdamW + BPR + KGE alternating phases. Writes data/processed/kgat_best.pt.
+python -m src.train               # fresh run
+python -m src.train --resume      # continue from last best checkpoint
+
+# 4. Final eval — KGAT vs popularity baseline, side-by-side, same protocol.
+python -m src.final_eval --split test --n-users 2000 --n-negatives 5000
+
+# 5. Pick a (user, track) pair worth explaining (top-K hit + artist + playlist hub).
+python -m src.pick_explain_pair
+
+# 6. Explain that pair: top attention paths + fidelity score.
+python -m src.explain --user N --track M --fidelity-samples 100
+
+# 7. Demo UI (KGAT vs popularity top-K + interactive explanation graph).
+streamlit run app.py
 ```
 
-Loads the graph, instantiates the model, runs a sub-graph forward, prints
-shapes. Use this to verify the install before launching a long training run.
+Hyperparameters: `src/config.py`.
 
-### 3. Train
+## Metrics
 
-```bash
-python -m src.train
-```
+Sampled-metrics protocol (per-user candidate sets: held-out positives ∪ shared
+negative pool, train positives masked). Both KGAT and the popularity baseline
+use the same eligible users, same per-user candidates, same seed.
 
-BPR loss with `LinkNeighborLoader` over `(user, liked, track)` edges. Evaluates
-every 5 epochs on the val split (sampled metrics) with patience-3 early
-stopping. Writes the best checkpoint to `data/processed/kgat_best.pt`.
+| Split | Sample (users / negs) | Metric | KGAT | Popularity | Lift |
+| --- | --- | --- | ---: | ---: | ---: |
+| test | 500 / 1 000 | NDCG@10 | 0.6418 | 0.4469 | +43.6% |
+| test | 500 / 1 000 | Recall@10 | — | — | ~+85% |
+| test | 2 000 / 5 000 | NDCG@10 | 0.3808 | 0.3079 | +23.7% |
+| val | 500 / 1 000 | NDCG@10 (best, epoch 30) | 0.7002 | — | — |
 
-Per-batch wall-clock baselines:
-
-| Device | ms/batch | Epoch (~954 batches) |
-| --- | --- | --- |
-| Apple M-series (MPS) | ~900 ms | ~15 min |
-| RTX 50-series (CUDA) | expected ~100–200 ms | ~2–3 min |
-
-Hyperparameters live in `src/config.py`.
-
-### 4. Evaluate
-
-```bash
-python -m src.evaluate
-```
-
-Sampled-metrics NDCG@10/20 and Recall@10/20 against the val split. With no
-trained checkpoint loaded, the run only verifies plumbing — numbers are
-meaningless. Edit the script to load `kgat_best.pt` for real metrics.
-
-### 5. Popularity baseline
-
-```bash
-python -m src.baselines
-```
-
-Track-popularity baseline under the identical sampled-metrics protocol as
-`evaluate.py`, so the numbers are directly comparable to KGAT.
-
-## Cross-machine workflow
-
-Code: push/pull via git.
-
-Data: either ship `data/processed/graph.pt` + `id_mappings.json` between
-machines (~few hundred MB), or copy the raw CSV and re-run `src.build_graph`.
-The training output (`kgat_best.pt`) is not committed; copy it manually if you
-need it elsewhere.
+Numbers grow as the candidate pool shrinks (fewer distractors per user). The
+2 000 / 5 000 setting is the thesis-quality reference; 500 / 1 000 matches the
+training-time eval used for early stopping.
 
 ## Layout
 
 ```
 src/
-  config.py          # all hyperparameters + device detection
-  build_graph.py     # CSV → HeteroData → graph.pt
-  model.py           # KGAT (HeteroConv + GATConv, per-edge-type)
-  train.py           # BPR loop with LinkNeighborLoader
-  evaluate.py        # sampled NDCG@K / Recall@K
-  baselines.py       # track-popularity baseline
+  config.py            # hyperparameters + device detection
+  build_graph.py       # CSV → HeteroData + 80/10/10 split → graph.pt
+  model.py             # KGAT (TransR attention, GCN aggregator, KGE loss)
+  train.py             # disjoint MP/sup split + BPR + KGE alternating loop
+  evaluate.py          # sampled NDCG@K / Recall@K
+  baselines.py         # track-popularity baseline (same protocol)
+  final_eval.py        # KGAT vs baseline side-by-side
+  explain.py           # top-K attention paths + fidelity test
+  pick_explain_pair.py # auto-pick a (user, track) worth explaining
 docs/
   architecture.md
-  adr/               # design decisions
-data/
-  spotify_dataset.csv      # raw, gitignored
-  processed/               # graph.pt, id_mappings.json, kgat_best.pt
+  adr/                 # design decisions
+app.py                 # Streamlit demo (KGAT vs popularity + path viz)
+smoke_test.py          # plumbing check
 ```

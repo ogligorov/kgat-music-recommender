@@ -1,203 +1,279 @@
-"""Streamlit demo for KGAT Music Recommender."""
+"""Streamlit demo for the v2 KGAT music recommender.
+
+Lives on top of the trained KGAT (4 node types: user/track/artist/playlist;
+6 directed relations; TransR attention) and the popularity baseline. Picks
+a user, shows KGAT top-K tracks vs. popularity top-K, and lets the user
+inspect explanation paths (direct / via_artist / via_playlist) for any
+recommended track.
+
+Embedding the full corpus (14k users × 381k tracks) once at startup is the
+slow part — wrapped in @st.cache_resource so it pays the cost a single time
+per process. Per-user scoring after that is a single matmul.
+"""
 
 import json
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import streamlit as st
 import torch
 from pyvis.network import Network
+from torch_geometric.loader import NeighborLoader
 
+from src.baselines import score_cold_user
+from src.build_graph import make_train_only_graph
 from src.config import Config
-from src.model import KGAT
+from src.evaluate import compute_final_embeddings
 from src.explain import find_explanation_path
-from src.baselines import popularity_baseline
+from src.model import KGAT
 
 
-@st.cache_resource
-def load_model_and_data():
+@st.cache_resource(show_spinner="Loading graph + model + embeddings (one-time, ~1 min)...")
+def load_everything():
     cfg = Config()
-    data = torch.load(cfg.processed_data_dir / "ckg_heterodata.pt", weights_only=False)
+    # Streamlit + MPS NeighborLoader incompatibility (aten::_convert_indices_from_coo_to_csr
+    # missing on MPS), so demo runs on CPU/CUDA only — auto-pick.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    data = torch.load(cfg.processed_data_dir / "graph.pt", weights_only=False)
+    train_data = make_train_only_graph(data)
 
     model = KGAT(
         n_users=data["user"].num_nodes,
+        n_tracks=data["track"].num_nodes,
         n_artists=data["artist"].num_nodes,
-        n_tags=data["tag"].num_nodes,
-        n_eras=data["era"].num_nodes,
+        n_playlists=data["playlist"].num_nodes,
         embed_dim=cfg.embed_dim,
         n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads,
         mess_dropout=cfg.mess_dropout,
+        kge_dim=cfg.kge_dim,
+        kge_reg=cfg.kge_reg,
+        leaky_relu_slope=cfg.leaky_relu_slope,
+    ).to(device)
+
+    init_loader = NeighborLoader(
+        train_data, num_neighbors=[3, 3, 3], input_nodes="user", batch_size=8,
     )
     with torch.no_grad():
-        model(data)
+        model(next(iter(init_loader)).to(device))
 
-    checkpoint = cfg.processed_data_dir / "kgat_best.pt"
-    if checkpoint.exists():
-        model.load_state_dict(torch.load(checkpoint, weights_only=True))
+    ckpt_path = cfg.processed_data_dir / "kgat_best.pt"
+    if not ckpt_path.exists():
+        st.error(f"No trained checkpoint at {ckpt_path}. Run `python -m src.train` first.")
+        st.stop()
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"])
     else:
-        st.warning("No trained checkpoint found. Showing untrained model outputs.")
+        model.load_state_dict(ckpt)
+    model.eval()
+
+    # Embed every user and every track once. compute_final_embeddings returns
+    # CPU tensors; we keep them there for the matmul.
+    n_users = data["user"].num_nodes
+    n_tracks = data["track"].num_nodes
+    user_emb = compute_final_embeddings(
+        model, train_data, "user", cfg, device,
+        input_nodes=torch.arange(n_users),
+    )
+    track_emb = compute_final_embeddings(
+        model, train_data, "track", cfg, device,
+        input_nodes=torch.arange(n_tracks),
+    )
+
+    # Popularity vector (train edges only — eval/test are held out).
+    liked = data["user", "liked", "track"]
+    train_edges = liked.edge_index[:, liked.train_mask]
+    track_pop = torch.bincount(train_edges[1], minlength=n_tracks).float()
+
+    # Per-user train positives for score masking.
+    train_pos_per_user: list[set[int]] = [set() for _ in range(n_users)]
+    for u, t in zip(train_edges[0].tolist(), train_edges[1].tolist()):
+        train_pos_per_user[u].add(t)
 
     with open(cfg.processed_data_dir / "id_mappings.json") as f:
         mappings = json.load(f)
+    idx_to_key = {
+        nt: {v: k for k, v in mappings[f"{nt}_to_idx"].items()}
+        for nt in ("user", "track", "artist", "playlist")
+    }
 
-    return model, data, mappings, cfg
-
-
-def get_recommendations(model, data, user_idx, top_k=10):
-    model.eval()
-    with torch.no_grad():
-        out = model(data)
-        user_emb = out["user"][user_idx]
-        artist_emb = out["artist"]
-        scores = user_emb @ artist_emb.T
-
-        # Mask out artists already in training set
-        train_mask = data["user", "listens_to", "artist"].train_mask
-        train_edges = data["user", "listens_to", "artist"].edge_index[:, train_mask]
-        user_mask = train_edges[0] == user_idx
-        train_artists = train_edges[1, user_mask]
-        scores[train_artists] = -float("inf")
-
-        top_scores, top_indices = torch.topk(scores, top_k)
-    return top_indices.numpy(), top_scores.numpy()
+    return {
+        "cfg": cfg,
+        "data": data,
+        "train_data": train_data,
+        "model": model,
+        "user_emb": user_emb,
+        "track_emb": track_emb,
+        "track_pop": track_pop,
+        "train_pos_per_user": train_pos_per_user,
+        "mappings": mappings,
+        "idx_to_key": idx_to_key,
+        "device": device,
+    }
 
 
-def get_popularity_recommendations(data, user_idx, top_k=10):
-    train_mask = data["user", "listens_to", "artist"].train_mask
-    train_edges = data["user", "listens_to", "artist"].edge_index[:, train_mask]
-
-    n_artists = data["artist"].num_nodes
-    counts = torch.zeros(n_artists)
-    for i in range(train_edges.shape[1]):
-        counts[train_edges[1, i]] += 1
-
-    # Exclude user's training items
-    user_mask = train_edges[0] == user_idx
-    user_artists = train_edges[1, user_mask]
-    counts[user_artists] = -1
-
-    top_indices = torch.argsort(counts, descending=True)[:top_k]
-    return top_indices.numpy()
+def kgat_topk(user_emb: torch.Tensor, track_emb: torch.Tensor,
+              user_idx: int, train_pos: set[int], top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = user_emb[user_idx] @ track_emb.T
+    if train_pos:
+        scores = scores.clone()
+        scores[torch.tensor(sorted(train_pos), dtype=torch.long)] = -1e9
+    top = torch.topk(scores, k=top_k)
+    return top.indices, top.values
 
 
-def get_artist_name(mappings, artist_idx):
-    orig_id = mappings.get("idx_to_artist", {}).get(str(artist_idx), "")
-    return mappings.get("artist_id_to_name", {}).get(str(orig_id), f"Artist {artist_idx}")
+def popularity_topk(track_pop: torch.Tensor, train_pos: set[int], top_k: int) -> torch.Tensor:
+    scores = track_pop.clone()
+    if train_pos:
+        scores[torch.tensor(sorted(train_pos), dtype=torch.long)] = -1.0
+    return torch.topk(scores, k=top_k).indices
 
 
-def get_tag_name(mappings, tag_idx):
-    tag_id = mappings.get("idx_to_tag", {}).get(str(tag_idx), "")
-    name = mappings.get("tag_id_to_name", {}).get(str(tag_id), "")
-    return name if name else f"Tag {tag_id}"
+def track_label(track_idx: int, mappings: dict, idx_to_key: dict) -> str:
+    key = idx_to_key["track"].get(track_idx)
+    if not key:
+        return f"track #{track_idx}"
+    disp = mappings.get("track_display", {}).get(key, {})
+    if disp:
+        return f"{disp.get('artistname', '?')} — {disp.get('trackname', '?')}"
+    return key
 
 
-def render_explanation_graph(paths, mappings):
-    net = Network(height="400px", width="100%", directed=True, notebook=False)
+def artist_label(artist_idx: int, mappings: dict, idx_to_key: dict) -> str:
+    key = idx_to_key["artist"].get(artist_idx, "")
+    return mappings.get("artist_display", {}).get(key, key or f"artist #{artist_idx}")
+
+
+def playlist_label(playlist_idx: int, mappings: dict, idx_to_key: dict) -> str:
+    key = idx_to_key["playlist"].get(playlist_idx, "")
+    return mappings.get("playlist_display", {}).get(key, key or f"playlist #{playlist_idx}")
+
+
+def node_label(node_type: str, node_idx: int, mappings: dict, idx_to_key: dict) -> str:
+    if node_type == "track":
+        return track_label(node_idx, mappings, idx_to_key)
+    if node_type == "artist":
+        return artist_label(node_idx, mappings, idx_to_key)
+    if node_type == "playlist":
+        return playlist_label(node_idx, mappings, idx_to_key)
+    if node_type == "user":
+        return idx_to_key["user"].get(node_idx, f"user #{node_idx}")
+    return f"{node_type} #{node_idx}"
+
+
+def render_explanation_graph(paths: list[dict], mappings: dict, idx_to_key: dict) -> Network:
+    net = Network(height="450px", width="100%", directed=True, notebook=False)
     net.barnes_hut()
+    color = {"user": "#4CAF50", "track": "#2196F3", "artist": "#FF9800", "playlist": "#9C27B0"}
+    size = {"user": 25, "track": 20, "artist": 18, "playlist": 18}
 
-    added_nodes = set()
-
+    added: set[str] = set()
     for path_info in paths:
         path = path_info["path"]
         attn = path_info["attention"]
-
         for node_type, node_idx in path:
             node_id = f"{node_type}_{node_idx}"
-            if node_id in added_nodes:
+            if node_id in added:
                 continue
-            added_nodes.add(node_id)
-
-            if node_type == "user":
-                net.add_node(node_id, label=f"User {node_idx}", color="#4CAF50", size=25)
-            elif node_type == "artist":
-                name = get_artist_name(mappings, node_idx)
-                net.add_node(node_id, label=name, color="#2196F3", size=20)
-            elif node_type == "tag":
-                name = get_tag_name(mappings, node_idx)
-                net.add_node(node_id, label=name, color="#FF9800", size=15)
-            elif node_type == "era":
-                net.add_node(node_id, label=f"Era {node_idx}", color="#9C27B0", size=15)
-
-        # Add edges
+            added.add(node_id)
+            net.add_node(
+                node_id,
+                label=node_label(node_type, node_idx, mappings, idx_to_key),
+                color=color.get(node_type, "#888"),
+                size=size.get(node_type, 15),
+            )
         for i in range(len(path) - 1):
             src_type, src_idx = path[i]
             dst_type, dst_idx = path[i + 1]
-            src_id = f"{src_type}_{src_idx}"
-            dst_id = f"{dst_type}_{dst_idx}"
-            net.add_edge(src_id, dst_id, value=attn, title=f"Attention: {attn:.4f}")
-
+            net.add_edge(
+                f"{src_type}_{src_idx}", f"{dst_type}_{dst_idx}",
+                value=float(attn), title=f"attention: {attn:.4f}",
+            )
     return net
 
 
 def main():
     st.set_page_config(page_title="KGAT Music Recommender", layout="wide")
     st.title("KGAT Music Recommender")
-    st.caption("Knowledge Graph Attention Network for Explainable Artist Recommendation")
+    st.caption("v2 4-node KG (user / track / artist / playlist) — TransR attention")
 
-    model, data, mappings, cfg = load_model_and_data()
+    state = load_everything()
+    n_users = state["data"]["user"].num_nodes
 
-    # Sidebar: user selection
-    n_users = data["user"].num_nodes
-    user_idx = st.sidebar.number_input("Select User ID", min_value=0, max_value=n_users - 1, value=0)
-    top_k = st.sidebar.slider("Number of recommendations", 5, 20, 10)
+    st.sidebar.header("User & display options")
+    user_idx = st.sidebar.number_input(
+        "User index", min_value=0, max_value=n_users - 1, value=0,
+    )
+    top_k = st.sidebar.slider("Recommendations to show", 5, 20, 10)
+    user_key = state["idx_to_key"]["user"].get(user_idx, "?")
+    n_train = len(state["train_pos_per_user"][user_idx])
+    st.sidebar.markdown(f"**User key:** `{user_key}`")
+    st.sidebar.markdown(f"**Train likes:** {n_train}")
 
-    # Main content: two columns
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("KGAT Recommendations")
-        rec_indices, rec_scores = get_recommendations(model, data, user_idx, top_k)
-
-        for i, (idx, score) in enumerate(zip(rec_indices, rec_scores)):
-            name = get_artist_name(mappings, int(idx))
-            st.write(f"**{i+1}.** {name} (score: {score:.3f})")
-
-    with col2:
-        st.subheader("Popularity Baseline")
-        pop_indices = get_popularity_recommendations(data, user_idx, top_k)
-
-        for i, idx in enumerate(pop_indices):
-            name = get_artist_name(mappings, int(idx))
-            st.write(f"**{i+1}.** {name}")
-
-    # Explanation section
-    st.divider()
-    st.subheader("Explanation: Why these recommendations?")
-
-    if len(rec_indices) > 0:
-        selected_artist = st.selectbox(
-            "Select an artist to explain",
-            options=rec_indices,
-            format_func=lambda x: get_artist_name(mappings, int(x)),
+    if n_train == 0:
+        st.warning(
+            "This user has no training likes — KGAT recommendations may be poor. "
+            "Falling back to global popularity for context."
         )
+        cold_top = score_cold_user(state["data"], top_k=top_k)
+        for i, t in enumerate(cold_top, 1):
+            st.write(f"**{i}.** {track_label(t, state['mappings'], state['idx_to_key'])}")
+        return
 
-        if selected_artist is not None:
-            paths = find_explanation_path(model, data, user_idx, int(selected_artist), top_k=5)
+    train_pos = state["train_pos_per_user"][user_idx]
+    kgat_idx, kgat_scores = kgat_topk(state["user_emb"], state["track_emb"],
+                                       user_idx, train_pos, top_k)
+    pop_idx = popularity_topk(state["track_pop"], train_pos, top_k)
 
-            if paths:
-                st.write(f"**Top attention paths** (user {user_idx} → {get_artist_name(mappings, int(selected_artist))}):")
-                for i, p in enumerate(paths):
-                    path_str = " → ".join(
-                        get_artist_name(mappings, idx) if ntype == "artist"
-                        else get_tag_name(mappings, idx) if ntype == "tag"
-                        else f"User {idx}" if ntype == "user"
-                        else f"Era {idx}"
-                        for ntype, idx in p["path"]
-                    )
-                    st.write(f"  {i+1}. {path_str} (attention: {p['attention']:.4f})")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("KGAT")
+        for i, (idx, score) in enumerate(zip(kgat_idx.tolist(), kgat_scores.tolist()), 1):
+            st.write(f"**{i}.** {track_label(idx, state['mappings'], state['idx_to_key'])} "
+                     f"  *(score {score:.3f})*")
+    with col2:
+        st.subheader("Popularity baseline")
+        for i, idx in enumerate(pop_idx.tolist(), 1):
+            st.write(f"**{i}.** {track_label(idx, state['mappings'], state['idx_to_key'])}")
 
-                # Graph visualization
-                net = render_explanation_graph(paths, mappings)
-                with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
-                    html_path = Path(tmp.name)
-                net.save_graph(str(html_path))
-                with open(html_path) as f:
-                    st.components.v1.html(f.read(), height=450)
-                html_path.unlink(missing_ok=True)
-            else:
-                st.info("No explanation paths found for this recommendation.")
+    st.divider()
+    st.subheader("Explanation: why did KGAT pick this track?")
+    selected = st.selectbox(
+        "Track to explain",
+        options=kgat_idx.tolist(),
+        format_func=lambda x: track_label(int(x), state["mappings"], state["idx_to_key"]),
+    )
+    if selected is None:
+        return
+
+    paths = find_explanation_path(
+        state["model"], state["train_data"].to(state["device"]),
+        int(user_idx), int(selected), top_k=5,
+    )
+    if not paths:
+        st.info(
+            "No explanation paths found. The model likely picked this track via "
+            "embedding similarity rather than a direct artist/playlist hop."
+        )
+        return
+
+    st.write(f"**Top-{len(paths)} attention paths** "
+             f"(user {user_idx} → {track_label(int(selected), state['mappings'], state['idx_to_key'])}):")
+    for i, p in enumerate(paths, 1):
+        path_str = " → ".join(
+            node_label(nt, idx, state["mappings"], state["idx_to_key"])
+            for nt, idx in p["path"]
+        )
+        st.write(f"{i}. **[{p['type']}]** {path_str}  *(attention {p['attention']:.4f})*")
+
+    net = render_explanation_graph(paths, state["mappings"], state["idx_to_key"])
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
+        html_path = Path(tmp.name)
+    net.save_graph(str(html_path))
+    with open(html_path) as f:
+        st.components.v1.html(f.read(), height=480)
+    html_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
