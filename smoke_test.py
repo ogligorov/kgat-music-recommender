@@ -1,11 +1,11 @@
 """Smoke test: load the graph, instantiate KGAT, verify a forward path that fits in memory.
 
 Verifies:
-1. MPS device availability
+1. Device availability (CUDA → MPS → CPU)
 2. graph.pt loads with the expected 4 node types / 6 edge types
 3. Full-graph forward — attempted; OOM is expected at our scale and triggers fallback
-4. NeighborLoader sub-graph forward + backward works on MPS
-5. Reports MPS memory used by the sampled forward
+4. NeighborLoader sub-graph forward + backward works on the selected device
+5. Reports memory used by the sampled forward (CUDA / MPS only)
 """
 
 import torch
@@ -18,12 +18,18 @@ EXPECTED_NODE_TYPES = {"user", "track", "artist", "playlist"}
 
 
 def check_device() -> str:
+    if torch.cuda.is_available():
+        x = torch.randn(4, 4, device="cuda")
+        _ = x @ x.T
+        name = torch.cuda.get_device_name(0)
+        print(f"[OK] CUDA available and functional ({name})")
+        return "cuda"
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         x = torch.randn(4, 4, device="mps")
         _ = x @ x.T
         print("[OK] MPS available and functional")
         return "mps"
-    print("[WARN] MPS not available, falling back to CPU")
+    print("[WARN] No GPU available, falling back to CPU")
     return "cpu"
 
 
@@ -54,6 +60,8 @@ def try_full_graph_forward(model: KGAT, data, device: str) -> bool:
     """
     if device == "mps":
         torch.mps.empty_cache()
+    elif device == "cuda":
+        torch.cuda.empty_cache()
     try:
         out = model(data)
         for nt, t in out.items():
@@ -61,11 +69,14 @@ def try_full_graph_forward(model: KGAT, data, device: str) -> bool:
         print("[OK] Full-graph forward fits in memory; can train without sampling.")
         return True
     except RuntimeError as e:
-        if "out of memory" in str(e).lower() or "MPS backend out of memory" in str(e):
+        msg = str(e).lower()
+        if "out of memory" in msg or "mps backend out of memory" in msg:
             print("[INFO] Full-graph forward OOMs (expected at our scale).")
             print("       -> Falling back to NeighborLoader-based training.")
             if device == "mps":
                 torch.mps.empty_cache()
+            elif device == "cuda":
+                torch.cuda.empty_cache()
             return False
         raise
 
@@ -101,6 +112,11 @@ def check_neighbor_loader_forward(model: KGAT, data, n: dict, device: str):
         cur_gb = torch.mps.current_allocated_memory() / (1024 ** 3)
         recommended_gb = torch.mps.recommended_max_memory() / (1024 ** 3)
         print(f"[INFO] MPS current allocated: {cur_gb:.2f} GB / recommended {recommended_gb:.2f} GB")
+    elif device == "cuda":
+        cur_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+        peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"[INFO] CUDA current allocated: {cur_gb:.2f} GB / peak {peak_gb:.2f} GB / total {total_gb:.2f} GB")
 
 
 def main():
