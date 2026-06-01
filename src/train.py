@@ -1,10 +1,33 @@
-"""Training loop for KGAT with BPR loss, using LinkNeighborLoader over (user, liked, track) edges."""
+"""Training loop for KGAT with BPR loss, using LinkNeighborLoader over (user, liked, track) edges.
 
-import random
+Negative sampling and message-passing leak prevention:
+
+  - Negative sampling is delegated to PyG's `NegativeSampling(mode="triplet")`
+    so each positive (u, t+) is paired with a randomly-corrupted dst (u, t-)
+    that shares the same user. The triplet API exposes aligned `src_index`,
+    `dst_pos_index`, `dst_neg_index` — no positional-zip assumption needed.
+
+  - LEAK FIX: `LinkNeighborLoader` does NOT auto-strip supervision edges from
+    the message-passing graph (PyG docs: "by default supervision edges in
+    `edge_label_index` will not get masked out during sampling"). If we use
+    every train edge as both an MP edge AND a supervision seed, the loader
+    samples the seed (u, t+) edge as a 1-hop neighbor of u, message passing
+    aggregates t+'s embedding directly into u's, and the model learns the
+    trivial "I'm connected → score high" rule. BPR loss then collapses to
+    ~0.06 from epoch 1 (vs the ~0.69 random-init starting point) and val
+    NDCG never escapes the popularity prior.
+
+    Fix: disjoint-split the train edges. 70% become MP-only (the loader's
+    edge_index, used purely for message passing), 30% become supervision-only
+    (the loader's edge_label_index, never appearing in the MP graph). The
+    split is deterministic via a fixed RNG seed so eval is reproducible.
+"""
+
 import time
 
 import torch
 from torch_geometric.loader import LinkNeighborLoader, NeighborLoader
+from torch_geometric.sampler import NegativeSampling
 
 from src.build_graph import make_train_only_graph
 from src.config import Config
@@ -12,46 +35,7 @@ from src.evaluate import evaluate_model
 from src.model import KGAT
 
 
-def build_user_positive_sets(edge_index: torch.Tensor, n_users: int) -> list[set[int]]:
-    """Per-user sets of positive track indices, used for neg-sample rejection."""
-    user_positives: list[set[int]] = [set() for _ in range(n_users)]
-    users = edge_index[0].numpy()
-    tracks = edge_index[1].numpy()
-    for u, t in zip(users, tracks):
-        user_positives[u].add(int(t))
-    return user_positives
-
-
-def sample_negatives_in_subgraph(
-    user_globals: list[int],
-    sub_track_globals: list[int],
-    user_positives: list[set[int]],
-    max_retries: int = 10,
-) -> torch.Tensor:
-    """Sample one negative track LOCAL index per seed user, drawing from the sub-graph's
-    track nodes and rejecting any track in the user's TRAIN positive set. After
-    `max_retries` rejected draws we accept whatever we have — at our scale (>10K
-    candidate tracks per sub-graph, hundreds of train positives per user) the
-    residual collision rate is negligible and a hard retry cap removes the
-    pathological loop risk for power users.
-
-    Pure-Python implementation: per-batch we make ~batch_size `random.randrange`
-    calls instead of allocating per-retry torch tensors. Eliminates the
-    `tensor.item()` MPS sync points and `torch.randint(...,(1,))` allocator hits
-    in the inner retry loop, which dominated wall-clock at batch_size=1048."""
-    n_sub_tracks = len(sub_track_globals)
-    n_seeds = len(user_globals)
-    neg_local = [random.randrange(n_sub_tracks) for _ in range(n_seeds)]
-    for i in range(n_seeds):
-        positives = user_positives[user_globals[i]]
-        for _ in range(max_retries):
-            if sub_track_globals[neg_local[i]] not in positives:
-                break
-            neg_local[i] = random.randrange(n_sub_tracks)
-    return torch.tensor(neg_local, dtype=torch.long)
-
-
-def train_epoch(model, loader, optimizer, user_positives, device, max_batches: int | None = None,
+def train_epoch(model, loader, optimizer, device, max_batches: int | None = None,
                 heartbeat_every: int = 50, epoch_label: str = "") -> float:
     model.train()
     # Accumulate loss on-device. `.item()` is only called at heartbeat (every
@@ -73,8 +57,6 @@ def train_epoch(model, loader, optimizer, user_positives, device, max_batches: i
         if is_mps:
             torch.mps.synchronize()
 
-    # Use explicit iterator so we can time loader.next() separately for the
-    # first 3 batches (debugging the 4 s/batch wall-clock).
     loader_iter = iter(loader)
     while True:
         if max_batches is not None and n_batches >= max_batches:
@@ -110,26 +92,20 @@ def train_epoch(model, loader, optimizer, user_positives, device, max_batches: i
             sync()
             phases["forward"] = time.perf_counter() - t
 
-        edge_label_index = batch["user", "liked", "track"].edge_label_index
-        user_local = edge_label_index[0]
-        pos_track_local = edge_label_index[1]
-
-        t = time.perf_counter()
-        user_globals = batch["user"].n_id[user_local].cpu().tolist()
-        sub_track_globals = batch["track"].n_id.cpu().tolist()
-        if debug_phase:
-            phases["sync_to_cpu"] = time.perf_counter() - t
-
-        t = time.perf_counter()
-        neg_track_local = sample_negatives_in_subgraph(
-            user_globals, sub_track_globals, user_positives
-        ).to(device)
-        if debug_phase:
-            phases["neg_sample"] = time.perf_counter() - t
+        # NegativeSampling(mode="triplet", amount=1) exposes the seed as three
+        # aligned local-index tensors. In HETEROGENEOUS mode PyG attaches them
+        # to the node stores (NOT the edge store): src_index goes on the source
+        # node type, dst_pos_index/dst_neg_index on the dst node type. See
+        # torch_geometric/loader/link_loader.py L325-327. The user is the same
+        # for the pos and neg pair by construction (dst-only corruption). No
+        # edge_label / edge_label_index in triplet mode.
+        src_local = batch["user"].src_index
+        pos_track_local = batch["track"].dst_pos_index
+        neg_track_local = batch["track"].dst_neg_index
 
         t = time.perf_counter()
         loss = model.bpr_loss(
-            out["user"][user_local],
+            out["user"][src_local],
             out["track"][pos_track_local],
             out["track"][neg_track_local],
         )
@@ -150,12 +126,9 @@ def train_epoch(model, loader, optimizer, user_positives, device, max_batches: i
             sync()
             phases["opt_step"] = time.perf_counter() - t
 
-        # Accumulate detached loss on-device. Only debug batches sync via
-        # `.item()` here, so per-phase totals stay realistic; steady-state
-        # batches keep the GPU queue full.
         if debug_phase:
             t = time.perf_counter()
-            loss_val = loss.item()
+            _ = loss.item()
             phases["loss_item"] = time.perf_counter() - t
             total_loss_t = total_loss_t + loss.detach()
         else:
@@ -175,11 +148,31 @@ def train_epoch(model, loader, optimizer, user_positives, device, max_batches: i
             elapsed = time.perf_counter() - t_epoch_start
             avg_ms = (elapsed / n_batches) * 1000
             remaining = (total - n_batches) * (elapsed / n_batches)
-            avg_loss = (total_loss_t / n_batches).item()  # one MPS sync per heartbeat
+            avg_loss = (total_loss_t / n_batches).item()
             print(f"  [{epoch_label}batch {n_batches}/{total}] avg {avg_ms:.0f} ms/batch | "
                   f"loss {avg_loss:.4f} | ETA {remaining:.0f}s", flush=True)
 
     return (total_loss_t / max(1, n_batches)).item()
+
+
+def disjoint_mp_sup_split(
+    train_mask: torch.Tensor, sup_ratio: float = 0.3, seed: int = 42
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a train_mask of shape (E,) into (mp_mask, sup_mask), both of
+    shape (E,), disjoint, summing to train_mask. `sup_ratio` of train edges
+    go to supervision-only. Deterministic via `seed` for reproducible runs."""
+    train_idx = train_mask.nonzero(as_tuple=True)[0]
+    n_train = train_idx.numel()
+    n_sup = int(n_train * sup_ratio)
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n_train, generator=g)
+    sup_idx = train_idx[perm[:n_sup]]
+    mp_idx = train_idx[perm[n_sup:]]
+    mp_mask = torch.zeros_like(train_mask)
+    sup_mask = torch.zeros_like(train_mask)
+    mp_mask[mp_idx] = True
+    sup_mask[sup_idx] = True
+    return mp_mask, sup_mask
 
 
 def main():
@@ -192,11 +185,25 @@ def main():
     data = torch.load(graph_path, weights_only=False)
     print(f"  loaded in {time.perf_counter() - t0:.1f}s", flush=True)
 
-    # Train-only graph for message passing. PyG's train_mask is metadata only —
-    # passing the full `data` to the loader leaks val/test edges through the GNN.
+    # Disjoint MP/supervision split within the train edges. See module docstring
+    # for the motivation. 30% of train edges become supervision-only seeds; the
+    # other 70% are the message-passing graph the loader samples neighbors from.
+    liked = data["user", "liked", "track"]
+    train_mask = liked.train_mask
+    mp_mask, sup_mask = disjoint_mp_sup_split(train_mask, sup_ratio=0.3, seed=42)
+    n_train = int(train_mask.sum())
+    n_mp = int(mp_mask.sum())
+    n_sup = int(sup_mask.sum())
+    print(f"Disjoint split: train={n_train:,} -> MP={n_mp:,} ({n_mp/n_train:.0%}) | "
+          f"sup={n_sup:,} ({n_sup/n_train:.0%})", flush=True)
+
+    # Train-only MP graph using the MP subset of train edges (NOT all train edges).
+    # PyG's train_mask is metadata only — passing the full `data` to the loader
+    # leaks val/test edges through the GNN, and even with all train edges in MP
+    # the supervision seed remains visible to its own batch's neighborhood.
     t0 = time.perf_counter()
-    train_data = make_train_only_graph(data)
-    print(f"Built train-only graph in {time.perf_counter() - t0:.1f}s", flush=True)
+    train_data = make_train_only_graph(data, mp_mask=mp_mask)
+    print(f"Built train-only MP graph in {time.perf_counter() - t0:.1f}s", flush=True)
 
     n_users = data["user"].num_nodes
     n_tracks = data["track"].num_nodes
@@ -210,7 +217,6 @@ def main():
         n_heads=cfg.n_heads, dropout=cfg.dropout,
     ).to(device)
 
-    # Initialize lazy GATConv parameters via one tiny sub-graph forward
     with torch.no_grad():
         init_loader = NeighborLoader(
             train_data, num_neighbors=[3, 3, 3], input_nodes="user", batch_size=8,
@@ -224,23 +230,28 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    liked = data["user", "liked", "track"]
-    train_mask = liked.train_mask
-    train_edges = liked.edge_index[:, train_mask]
-    print(f"Building user-positive sets ({train_edges.shape[1]:,} train edges)...", flush=True)
-    t0 = time.perf_counter()
-    user_positives = build_user_positive_sets(train_edges, n_users)
-    print(f"  built in {time.perf_counter() - t0:.1f}s", flush=True)
+    # Supervision seeds = train edges NOT in the MP graph. By construction these
+    # cannot appear as neighbors when sampling around themselves, so the loader
+    # cannot leak the answer into the user/track embeddings before scoring.
+    sup_edges = liked.edge_index[:, sup_mask]
 
     print(f"Constructing LinkNeighborLoader (batch_size={cfg.batch_size}, "
-          f"num_neighbors={cfg.num_neighbors})...", flush=True)
+          f"num_neighbors={cfg.num_neighbors}, neg_sampling=triplet/amount=1)...", flush=True)
     t0 = time.perf_counter()
+    # neg_sampling=NegativeSampling(mode="triplet", amount=1) corrupts the dst
+    # only — each positive (u, t+) yields a (u, t-) with t- a uniform random
+    # track. PyG attaches src_index, dst_pos_index, dst_neg_index to the seed
+    # storage; user alignment between pos and neg is guaranteed by construction.
+    # Residual collisions (t- happens to also be a true positive for u) are
+    # negligible at this corpus size — well within BPR's robustness to a small
+    # fraction of mislabeled negatives, so we don't reject them.
     loader = LinkNeighborLoader(
         train_data,
         num_neighbors=cfg.num_neighbors,
-        edge_label_index=(("user", "liked", "track"), train_edges),
+        edge_label_index=(("user", "liked", "track"), sup_edges),
         batch_size=cfg.batch_size,
         shuffle=True,
+        neg_sampling=NegativeSampling(mode="triplet", amount=1),
     )
     n_batches_per_epoch = len(loader)
     max_batches_per_epoch = cfg.edges_per_epoch // cfg.batch_size
@@ -261,7 +272,7 @@ def main():
     for epoch in range(1, cfg.n_epochs + 1):
         t0 = time.perf_counter()
         train_loss = train_epoch(
-            model, loader, optimizer, user_positives, device,
+            model, loader, optimizer, device,
             max_batches=max_batches_per_epoch,
             epoch_label=f"e{epoch} ",
         )

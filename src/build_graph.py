@@ -174,26 +174,36 @@ def split_interactions(
     return {"train": train_mask, "val": val_mask, "test": test_mask}
 
 
-def make_train_only_graph(data: HeteroData) -> HeteroData:
+def make_train_only_graph(
+    data: HeteroData, mp_mask: torch.Tensor | None = None
+) -> HeteroData:
     """Build a HeteroData whose (user, liked, track) and (track, rev_liked, user)
-    edge_indices are filtered to train-split edges only. All other edge types and
-    node counts are shared by reference.
+    edge_indices are filtered to a chosen subset. All other edge types and node
+    counts are shared by reference.
 
     This is required because PyG's `train_mask` is metadata: it is NOT applied
     automatically during message passing. Forwarding `data` directly leaks val/test
     labels into the GNN, contaminating both training (model sees the answer) and
     evaluation (embeddings encode the held-out edges).
 
-    Use this for any forward pass — training, validation embedding, test embedding.
-    Keep the original `data` only for reading val_mask/test_mask ground truth.
+    `mp_mask` controls which edges survive into the message-passing graph:
+      - None (default): use `train_mask`. Correct for evaluation, where every
+        train edge should inform the model's view of users/tracks.
+      - Custom bool mask of length |liked edges|: use during supervised training
+        to disjoint-split train edges into a message-passing pool (mp_mask=True)
+        and a supervision pool (mp_mask=False, fed as edge_label_index). Without
+        this disjoint split, LinkNeighborLoader leaves the supervision edge in
+        the MP graph for its own batch and the model trivially copies the
+        positive track's embedding into the user node before scoring it.
     """
-    train_mask = data["user", "liked", "track"].train_mask
+    if mp_mask is None:
+        mp_mask = data["user", "liked", "track"].train_mask
     new_data = HeteroData()
     for nt in data.node_types:
         new_data[nt].num_nodes = data[nt].num_nodes
     for et in data.edge_types:
         if et in (("user", "liked", "track"), ("track", "rev_liked", "user")):
-            new_data[et].edge_index = data[et].edge_index[:, train_mask]
+            new_data[et].edge_index = data[et].edge_index[:, mp_mask]
         else:
             new_data[et].edge_index = data[et].edge_index
     return new_data
