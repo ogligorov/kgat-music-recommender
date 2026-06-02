@@ -18,6 +18,7 @@ the message-passing the model actually saw at training time.
 """
 
 import json
+import time
 
 import torch
 import torch.nn.functional as F
@@ -283,8 +284,10 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
 
     changes = 0
     total = 0
+    n_attempted = len(sample_indices)
+    t_start = time.perf_counter()
 
-    for idx in sample_indices.tolist():
+    for i, idx in enumerate(sample_indices.tolist(), 1):
         user_idx = test_edges[0, idx].item()
         track_idx = test_edges[1, idx].item()
 
@@ -295,6 +298,10 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
             precomputed_attentions=all_layer_attentions,
         )
         if not paths or paths[0]["type"] == "direct":
+            elapsed = time.perf_counter() - t_start
+            eta = elapsed / i * (n_attempted - i)
+            print(f"  [{i}/{n_attempted}] direct/no path — skipped "
+                  f"(elapsed {elapsed:.0f}s, ETA {eta:.0f}s)", flush=True)
             continue
 
         # Hub node sits at index 2 in via_artist / via_playlist paths.
@@ -326,8 +333,14 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
         if masked_score < original_score:
             changes += 1
         total += 1
+        elapsed = time.perf_counter() - t_start
+        eta = elapsed / i * (n_attempted - i)
+        print(f"  [{i}/{n_attempted}] {paths[0]['type']:<13} "
+              f"orig={original_score:+.3f} masked={masked_score:+.3f} "
+              f"{'DROP' if masked_score < original_score else 'keep'} | "
+              f"changes={changes}/{total} | "
+              f"elapsed {elapsed:.0f}s ETA {eta:.0f}s", flush=True)
 
-    n_attempted = len(sample_indices)
     fidelity = changes / total if total > 0 else 0.0
     coverage = total / n_attempted if n_attempted > 0 else 0.0
     return fidelity, coverage
@@ -366,7 +379,9 @@ def main():
     from src.config import Config
 
     cfg = Config()
-    device = torch.device(cfg.device)
+    # Full-graph attention extraction OOMs on consumer GPUs at this scale (17M
+    # edges × 6 relations). CPU is slower but reliable.
+    device = torch.device("cpu")
 
     print(f"Loading graph from {cfg.processed_data_dir / 'graph.pt'}...")
     data = torch.load(cfg.processed_data_dir / "graph.pt", weights_only=False)
