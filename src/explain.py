@@ -256,10 +256,11 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
                   precomputed_attentions: list[dict[tuple, torch.Tensor]] | None = None,
                   ) -> tuple[float, float]:
     """For sampled (user, target_track) test edges, find the top explanation
-    path; if it's via_artist or via_playlist, zero the hub node's initial
-    embedding and re-forward. Fidelity = fraction of samples where the
-    masked score is lower than the original. `data` is the FULL graph (we
-    need test_mask); message passing happens on the train-only graph.
+    path; if it's via_artist or via_playlist, drop every edge incident on the
+    hub node from the message-passing graph and re-forward. Fidelity =
+    fraction of samples where the masked score is lower than the original.
+    `data` is the FULL graph (we need test_mask); message passing happens on
+    the train-only graph.
 
     Pass `precomputed_attentions` to skip the (expensive) full-graph attention
     extraction — useful when running the per-sample masked forwards on GPU
@@ -316,17 +317,25 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
             continue
         mid_node_type, mid_node_idx = path[2]
 
-        # Replicate `model.forward` with one row of the hub embedding zeroed.
-        # forward_one_layer → mess_dropout (no-op in eval) → L2-norm, concat
-        # layers including UN-normalized initial. Must match forward() exactly.
-        x_dict = model.get_initial_embeddings(train_data)
-        x_dict = {k: v.clone() for k, v in x_dict.items()}
-        x_dict[mid_node_type][mid_node_idx] = 0.0
+        # Edge-level masking: drop every edge incident on the hub from the
+        # message-passing graph, then re-forward. Stronger than zeroing the
+        # hub's initial embedding (which gets reconstructed at layer 1+ from
+        # the hub's incoming messages); cutting edges severs the hub entirely.
+        masked_edge_index_dict = {}
+        for et, ei in train_data.edge_index_dict.items():
+            s_type, _, d_type = et
+            keep = torch.ones(ei.shape[1], dtype=torch.bool, device=ei.device)
+            if s_type == mid_node_type:
+                keep &= ei[0] != mid_node_idx
+            if d_type == mid_node_type:
+                keep &= ei[1] != mid_node_idx
+            masked_edge_index_dict[et] = ei[:, keep]
 
+        x_dict = model.get_initial_embeddings(train_data)
         layer_outputs = {k: [v] for k, v in x_dict.items()}
         for layer_idx in range(model.n_layers):
             x_dict = model.forward_one_layer(
-                x_dict, train_data.edge_index_dict, layer_idx,
+                x_dict, masked_edge_index_dict, layer_idx,
             )
             x_dict = {k: F.normalize(v, p=2, dim=-1) for k, v in x_dict.items()}
             for k in layer_outputs:
