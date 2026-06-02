@@ -252,19 +252,13 @@ def find_explanation_path(
 
 @torch.no_grad()
 def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
-                  seed: int = 42,
-                  precomputed_attentions: list[dict[tuple, torch.Tensor]] | None = None,
-                  ) -> tuple[float, float]:
+                  seed: int = 42) -> tuple[float, float]:
     """For sampled (user, target_track) test edges, find the top explanation
     path; if it's via_artist or via_playlist, drop every edge incident on the
     hub node from the message-passing graph and re-forward. Fidelity =
     fraction of samples where the masked score is lower than the original.
     `data` is the FULL graph (we need test_mask); message passing happens on
     the train-only graph.
-
-    Pass `precomputed_attentions` to skip the (expensive) full-graph attention
-    extraction — useful when running the per-sample masked forwards on GPU
-    while keeping the one-time attention pass on CPU.
 
     Returns (fidelity, coverage):
       fidelity = changes / total
@@ -281,7 +275,7 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
     user_emb = out["user"]
     track_emb = out["track"]
 
-    all_layer_attentions = precomputed_attentions or extract_attention_weights(model, train_data)
+    all_layer_attentions = extract_attention_weights(model, train_data)
 
     test_mask = data["user", "liked", "track"].test_mask
     test_edges = data["user", "liked", "track"].edge_index[:, test_mask]
@@ -394,12 +388,9 @@ def main():
     from src.config import Config
 
     cfg = Config()
-    # Hybrid CPU/GPU: full-graph attention extraction OOMs on consumer GPUs
-    # (~6 GB peak from the per-dst all_msgs concat across all relations), so
-    # we run that one-time pass on CPU. The repeated per-sample masked
-    # forwards inside fidelity_test fit on 8 GB and are ~10x faster on GPU.
-    cpu = torch.device("cpu")
-    gpu = torch.device("cuda") if torch.cuda.is_available() else cpu
+    # Full-graph attention extraction OOMs on consumer GPUs at this scale (17M
+    # edges × 6 relations). CPU is slower but reliable.
+    device = torch.device("cpu")
 
     print(f"Loading graph from {cfg.processed_data_dir / 'graph.pt'}...")
     data = torch.load(cfg.processed_data_dir / "graph.pt", weights_only=False)
@@ -416,7 +407,7 @@ def main():
         kge_dim=cfg.kge_dim,
         kge_reg=cfg.kge_reg,
         leaky_relu_slope=cfg.leaky_relu_slope,
-    ).to(cpu)
+    ).to(device)
 
     # Initialize lazy params via one tiny sub-graph forward. NeighborLoader
     # requires CPU tensors (MPS lacks CSR conversion), so we sample on CPU
@@ -425,13 +416,15 @@ def main():
         train_data, num_neighbors=[3, 3, 3], input_nodes="user", batch_size=8,
     )
     with torch.no_grad():
-        model(next(iter(init_loader)).to(cpu))
+        model(next(iter(init_loader)).to(device))
 
-    train_data = train_data.to(cpu)
+    # Move the train-only graph to device for find_explanation_path /
+    # fidelity_test forwards.
+    train_data = train_data.to(device)
 
     checkpoint = cfg.processed_data_dir / "kgat_best.pt"
     if checkpoint.exists():
-        ckpt = torch.load(checkpoint, map_location=cpu, weights_only=False)
+        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             model.load_state_dict(ckpt["model_state_dict"])
         else:
@@ -441,16 +434,8 @@ def main():
         print(f"WARNING: no checkpoint at {checkpoint}; attention weights and "
               f"fidelity numbers will be meaningless on an untrained model.")
 
-    print("\nExtracting per-edge attention weights on CPU (one-time)...")
-    t_attn = time.perf_counter()
-    all_layer_attentions = extract_attention_weights(model, train_data)
-    print(f"  done in {time.perf_counter() - t_attn:.1f}s")
-
     print(f"\nExplanation paths for user={args.user} -> track={args.track}:")
-    paths = find_explanation_path(
-        model, train_data, args.user, args.track, top_k=5,
-        precomputed_attentions=all_layer_attentions,
-    )
+    paths = find_explanation_path(model, train_data, args.user, args.track, top_k=5)
 
     mappings_path = cfg.processed_data_dir / "id_mappings.json"
     mappings: dict = {}
@@ -473,18 +458,8 @@ def main():
             label = _label_for(node_type, node_idx, mappings, idx_to_key)
             print(f"    {node_type}[{node_idx}] {label}")
 
-    # Move model to GPU for the per-sample masked forwards. Attention dict
-    # stays on CPU; _get_edge_attention only does Python-int indexing into it,
-    # so cross-device is fine.
-    if gpu != cpu:
-        print(f"\nMoving model to {gpu} for fidelity test...")
-        model = model.to(gpu)
-
-    print(f"\nRunning fidelity test ({args.fidelity_samples} samples) on {gpu}...")
-    fidelity, coverage = fidelity_test(
-        model, data, n_samples=args.fidelity_samples,
-        precomputed_attentions=all_layer_attentions,
-    )
+    print(f"\nRunning fidelity test ({args.fidelity_samples} samples)...")
+    fidelity, coverage = fidelity_test(model, data, n_samples=args.fidelity_samples)
     print(f"Fidelity score: {fidelity:.4f} (coverage: {coverage:.2%})")
     print("  fidelity   = fraction of testable samples where masking the hub "
           "node lowered the score")
