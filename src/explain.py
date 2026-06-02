@@ -23,10 +23,54 @@ import time
 import torch
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
-from torch_geometric.utils import scatter, softmax
+from torch_geometric.utils import softmax
 
 from src.build_graph import make_train_only_graph
 from src.model import EDGE_TYPES, KGAT
+
+
+# Relations that `_get_edge_attention` and `find_explanation_path` look up by
+# (src, dst). Subset of `EDGE_TYPES` — only the ones queried for the three
+# path types. Kept in module scope so callers can introspect / cache.
+LOOKUP_EDGE_TYPES: tuple[tuple[str, str, str], ...] = (
+    ("user", "liked", "track"),
+    ("track", "performed_by", "artist"),
+    ("artist", "rev_performed_by", "track"),
+    ("track", "in_playlist", "playlist"),
+    ("playlist", "rev_in_playlist", "track"),
+)
+
+
+def build_edge_indexes(data: HeteroData) -> dict[tuple, dict[int, dict[int, int]]]:
+    """Per-relation `src -> {dst: edge_idx}` lookup tables. Used both to
+    enumerate candidate paths (user's liked tracks, target's playlists, etc.)
+    and to retrieve per-edge attention in O(1) instead of an O(E) edge_index
+    scan. One-time O(sum_E) build; ~3-4 GB peak for the full 17M-edge graph
+    (dominated by `liked`).
+
+    Duplicate (src, dst) edges are resolved by `setdefault` to keep the
+    first-occurrence index — matching the original `(ei[0]==s) & (ei[1]==d)`
+    + `[0]` semantics that this lookup replaces."""
+    indexes: dict[tuple, dict[int, dict[int, int]]] = {}
+    for et in LOOKUP_EDGE_TYPES:
+        if et not in data.edge_types:
+            indexes[et] = {}
+            continue
+        ei = data[et].edge_index
+        if ei is None or ei.numel() == 0:
+            indexes[et] = {}
+            continue
+        src_list = ei[0].tolist()
+        dst_list = ei[1].tolist()
+        idx: dict[int, dict[int, int]] = {}
+        for i, (s, d) in enumerate(zip(src_list, dst_list)):
+            bucket = idx.get(s)
+            if bucket is None:
+                bucket = {}
+                idx[s] = bucket
+            bucket.setdefault(d, i)
+        indexes[et] = idx
+    return indexes
 
 
 def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple, torch.Tensor]]:
@@ -37,6 +81,12 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
     post-softmax attention tensor back per relation. The softmax denominator
     runs across all incoming relations to a destination, so per-relation
     attention numbers are only meaningful AFTER the joint softmax.
+
+    To keep peak memory low, we never concatenate every relation's source
+    embeddings into a single `all_msgs` tensor: per-relation logits are
+    concatenated only for the joint softmax, then attention is sliced back
+    per relation and `index_add_`ed into the destination accumulator one
+    relation at a time.
     """
     model.eval()
     x_dict = model.get_initial_embeddings(data)
@@ -46,10 +96,12 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
 
     with torch.no_grad():
         for layer_idx in range(model.n_layers):
-            # Per-destination buffers; track each relation's slice so we can
-            # split the softmax output back.
-            per_dst: dict[str, dict[str, list]] = {
-                nt: {"logits": [], "msgs": [], "dst": [], "rel_slices": []}
+            # Per-destination buffers. `rel_data` holds one entry per relation
+            # pointing to this dst: (edge_type, slice or None, x_src or None,
+            # dst_local or None). Empty relations carry `None`s so we can
+            # still emit a zero-length `layer_attn[et]` for them later.
+            per_dst: dict[str, dict] = {
+                nt: {"logits": [], "rel_data": []}
                 for nt in x_dict
             }
             cursors: dict[str, int] = {nt: 0 for nt in x_dict}
@@ -58,7 +110,7 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
                 s_type, _, d_type = et
                 ei = edge_index_dict.get(et)
                 if ei is None or ei.numel() == 0:
-                    per_dst[d_type]["rel_slices"].append((et, None))
+                    per_dst[d_type]["rel_data"].append((et, None, None, None))
                     continue
                 src_local, dst_local = ei[0], ei[1]
                 x_src = x_dict[s_type][src_local]
@@ -72,9 +124,7 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
                 end = start + logit.numel()
                 cursors[d_type] = end
                 per_dst[d_type]["logits"].append(logit)
-                per_dst[d_type]["msgs"].append(x_src)
-                per_dst[d_type]["dst"].append(dst_local)
-                per_dst[d_type]["rel_slices"].append((et, (start, end)))
+                per_dst[d_type]["rel_data"].append((et, (start, end), x_src, dst_local))
 
             layer_attn: dict[tuple, torch.Tensor] = {}
             out_dict: dict[str, torch.Tensor] = {}
@@ -82,17 +132,35 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
                 n_dst = x_dict[nt].size(0)
                 if not buf["logits"]:
                     out_dict[nt] = torch.zeros_like(x_dict[nt])
-                    for et, _ in buf["rel_slices"]:
+                    for et, _, _, _ in buf["rel_data"]:
                         layer_attn[et] = torch.zeros(0)
                     continue
                 all_logits = torch.cat(buf["logits"], dim=0)
-                all_msgs = torch.cat(buf["msgs"], dim=0)
-                all_dst = torch.cat(buf["dst"], dim=0)
+                # `rel_data` and `logits` are appended in lockstep in
+                # EDGE_TYPES order, so filtering `rel_data` by `sl is not None`
+                # yields dst tensors in the same order as `logits` — required
+                # for the joint softmax to align edges with their destinations.
+                all_dst = torch.cat(
+                    [d for _, sl, _, d in buf["rel_data"] if sl is not None],
+                    dim=0,
+                )
                 attn = softmax(all_logits, all_dst, num_nodes=n_dst)
-                weighted = all_msgs * attn.unsqueeze(-1)
-                out_dict[nt] = scatter(weighted, all_dst, dim=0, dim_size=n_dst, reduce="sum")
-                for et, sl in buf["rel_slices"]:
-                    layer_attn[et] = attn[sl[0]:sl[1]] if sl is not None else torch.zeros(0)
+                # Per-relation scatter avoids materializing a single
+                # concatenated `all_msgs` (the original peak-memory hotspot).
+                first_x_src = next(x for _, sl, x, _ in buf["rel_data"] if sl is not None)
+                embed_dim = first_x_src.size(-1)
+                out = torch.zeros(
+                    (n_dst, embed_dim),
+                    device=x_dict[nt].device, dtype=x_dict[nt].dtype,
+                )
+                for et, sl, x_src_r, dst_r in buf["rel_data"]:
+                    if sl is None:
+                        layer_attn[et] = torch.zeros(0)
+                        continue
+                    attn_r = attn[sl[0]:sl[1]]
+                    out.index_add_(0, dst_r, x_src_r * attn_r.unsqueeze(-1))
+                    layer_attn[et] = attn_r
+                out_dict[nt] = out
 
             all_layer_attentions.append(layer_attn)
 
@@ -112,15 +180,17 @@ def _get_edge_attention(
     edge_type: tuple,
     src_idx: int,
     dst_idx: int,
-    data: HeteroData,
+    indexes: dict[tuple, dict[int, dict[int, int]]],
 ) -> float:
     """Mean attention across layers for the (src_idx → dst_idx) edge of
-    `edge_type`. Returns 0.0 if the edge isn't in the graph."""
-    edge_index = data[edge_type].edge_index
-    mask = (edge_index[0] == src_idx) & (edge_index[1] == dst_idx)
-    if not mask.any():
+    `edge_type`. O(1) lookup via the prebuilt `indexes` table. Returns 0.0
+    if the edge isn't in the graph."""
+    bucket = indexes.get(edge_type, {}).get(src_idx)
+    if bucket is None:
         return 0.0
-    edge_idx = mask.nonzero(as_tuple=True)[0][0].item()
+    edge_idx = bucket.get(dst_idx)
+    if edge_idx is None:
+        return 0.0
 
     total = 0.0
     count = 0
@@ -140,26 +210,33 @@ def find_explanation_path(
     top_k: int = 3,
     max_user_tracks: int = 50,
     precomputed_attentions: list[dict[tuple, torch.Tensor]] | None = None,
+    indexes: dict[tuple, dict[int, dict[int, int]]] | None = None,
 ) -> list[dict]:
     """Top-k paths user → target_track ranked by geometric-mean edge attention.
 
     `data` should be the train-only graph (see `make_train_only_graph`); a
     direct edge will only register if it was in train, which is what we want
-    when explaining a held-out recommendation."""
+    when explaining a held-out recommendation.
+
+    Pass `precomputed_attentions` and `indexes` to skip per-call rebuilds —
+    both are reusable across users when the message-passing graph is fixed."""
     all_layer_attentions = precomputed_attentions or extract_attention_weights(model, data)
+    if indexes is None:
+        indexes = build_edge_indexes(data)
     paths: list[dict] = []
 
-    liked = data["user", "liked", "track"].edge_index
-    perf = data["track", "performed_by", "artist"].edge_index
-    in_pl = data["track", "in_playlist", "playlist"].edge_index
+    liked_idx = indexes[("user", "liked", "track")]
+    perf_idx = indexes[("track", "performed_by", "artist")]
+    in_pl_idx = indexes[("track", "in_playlist", "playlist")]
+
+    user_liked = liked_idx.get(user_idx, {})
 
     # 1-hop direct edge. Use the same cross-layer mean as via_artist /
     # via_playlist so direct-path scores are comparable to multi-hop ones.
-    direct_mask = (liked[0] == user_idx) & (liked[1] == track_idx)
-    if direct_mask.any():
+    if track_idx in user_liked:
         attn = _get_edge_attention(
             all_layer_attentions, ("user", "liked", "track"),
-            user_idx, track_idx, data,
+            user_idx, track_idx, indexes,
         )
         paths.append({
             "type": "direct",
@@ -168,9 +245,10 @@ def find_explanation_path(
             "attention": attn,
         })
 
-    # User's liked tracks — capped for tractability on power users.
-    user_mask = liked[0] == user_idx
-    user_tracks = liked[1, user_mask].unique()[:max_user_tracks].tolist()
+    # User's liked tracks — capped for tractability on power users. Sort
+    # for deterministic ordering across runs (dict insertion order would
+    # otherwise leak edge_index ordering into the cap).
+    user_tracks = sorted(user_liked.keys())[:max_user_tracks]
     if not user_tracks:
         paths.sort(key=lambda p: p["attention"], reverse=True)
         return paths[:top_k]
@@ -179,26 +257,29 @@ def find_explanation_path(
     # artist (one row in `performed_by` per track), so the only candidate
     # mid-artist is the target's artist; we just check whether each user-liked
     # track shares it.
-    target_artist_mask = perf[0] == track_idx
-    if target_artist_mask.any():
-        target_artist = perf[1, target_artist_mask][0].item()
+    target_artist_bucket = perf_idx.get(track_idx)
+    if target_artist_bucket:
+        # next(iter(...)) matches the original "first edge_index occurrence"
+        # behavior because `build_edge_indexes` inserts in edge_index order
+        # and dict iteration is insertion-ordered (Python 3.7+).
+        target_artist = next(iter(target_artist_bucket))
         for track_a in user_tracks:
             if track_a == track_idx:
                 continue
-            shares_artist = ((perf[0] == track_a) & (perf[1] == target_artist)).any()
-            if not shares_artist:
+            track_a_bucket = perf_idx.get(track_a)
+            if not track_a_bucket or target_artist not in track_a_bucket:
                 continue
             a1 = _get_edge_attention(
                 all_layer_attentions, ("user", "liked", "track"),
-                user_idx, track_a, data,
+                user_idx, track_a, indexes,
             )
             a2 = _get_edge_attention(
                 all_layer_attentions, ("track", "performed_by", "artist"),
-                track_a, target_artist, data,
+                track_a, target_artist, indexes,
             )
             a3 = _get_edge_attention(
                 all_layer_attentions, ("artist", "rev_performed_by", "track"),
-                target_artist, track_idx, data,
+                target_artist, track_idx, indexes,
             )
             paths.append({
                 "type": "via_artist",
@@ -214,26 +295,26 @@ def find_explanation_path(
     # via_playlist: user → track_A → playlist → target_track. A playlist
     # qualifies if it contains both track_A and the target. Many tracks live
     # on dozens of playlists, so cap shared playlists per (track_a) pair.
-    target_pl_mask = in_pl[0] == track_idx
-    target_playlists = set(in_pl[1, target_pl_mask].cpu().tolist())
+    target_pl_bucket = in_pl_idx.get(track_idx, {})
+    target_playlists = set(target_pl_bucket.keys())
     if target_playlists:
         for track_a in user_tracks:
             if track_a == track_idx:
                 continue
-            track_a_pl_mask = in_pl[0] == track_a
-            shared = list(set(in_pl[1, track_a_pl_mask].cpu().tolist()) & target_playlists)[:5]
+            track_a_pl_bucket = in_pl_idx.get(track_a, {})
+            shared = list(set(track_a_pl_bucket.keys()) & target_playlists)[:5]
             for pl_idx in shared:
                 a1 = _get_edge_attention(
                     all_layer_attentions, ("user", "liked", "track"),
-                    user_idx, track_a, data,
+                    user_idx, track_a, indexes,
                 )
                 a2 = _get_edge_attention(
                     all_layer_attentions, ("track", "in_playlist", "playlist"),
-                    track_a, pl_idx, data,
+                    track_a, pl_idx, indexes,
                 )
                 a3 = _get_edge_attention(
                     all_layer_attentions, ("playlist", "rev_in_playlist", "track"),
-                    pl_idx, track_idx, data,
+                    pl_idx, track_idx, indexes,
                 )
                 paths.append({
                     "type": "via_playlist",
@@ -252,13 +333,24 @@ def find_explanation_path(
 
 @torch.no_grad()
 def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
-                  seed: int = 42) -> tuple[float, float]:
+                  seed: int = 42,
+                  precomputed_attentions: list[dict[tuple, torch.Tensor]] | None = None,
+                  indexes: dict[tuple, dict[int, dict[int, int]]] | None = None,
+                  ) -> tuple[float, float]:
     """For sampled (user, target_track) test edges, find the top explanation
     path; if it's via_artist or via_playlist, drop every edge incident on the
     hub node from the message-passing graph and re-forward. Fidelity =
     fraction of samples where the masked score is lower than the original.
     `data` is the FULL graph (we need test_mask); message passing happens on
     the train-only graph.
+
+    Pass `precomputed_attentions` and `indexes` to skip the (expensive)
+    one-time attention extraction and edge-index lookup table builds — both
+    can be reused across calls. **Both must have been built against the
+    same train-only graph derived from `data`** (i.e. the output of
+    `make_train_only_graph(data)`); silent corruption will result if they
+    were built against a different graph (e.g. the full graph). A cheap
+    edge-count sanity check is performed up front.
 
     Returns (fidelity, coverage):
       fidelity = changes / total
@@ -275,7 +367,25 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
     user_emb = out["user"]
     track_emb = out["track"]
 
-    all_layer_attentions = extract_attention_weights(model, train_data)
+    if precomputed_attentions is None:
+        precomputed_attentions = extract_attention_weights(model, train_data)
+    else:
+        # Sanity: per-layer attention vectors should have one entry per edge
+        # in `train_data` for every populated relation. Catches the common
+        # mistake of passing attentions built from the full graph.
+        first_layer = precomputed_attentions[0]
+        for et in EDGE_TYPES:
+            n_edges = train_data[et].edge_index.shape[1] if et in train_data.edge_types else 0
+            attn_len = first_layer.get(et, torch.zeros(0)).numel()
+            if n_edges > 0 and attn_len != n_edges:
+                raise ValueError(
+                    f"precomputed_attentions[{et}] has {attn_len} entries but "
+                    f"train_data[{et}] has {n_edges} edges — were they built "
+                    f"against different graphs?"
+                )
+
+    if indexes is None:
+        indexes = build_edge_indexes(train_data)
 
     test_mask = data["user", "liked", "track"].test_mask
     test_edges = data["user", "liked", "track"].edge_index[:, test_mask]
@@ -296,7 +406,8 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
 
         paths = find_explanation_path(
             model, train_data, user_idx, track_idx, top_k=1,
-            precomputed_attentions=all_layer_attentions,
+            precomputed_attentions=precomputed_attentions,
+            indexes=indexes,
         )
         if not paths or paths[0]["type"] == "direct":
             elapsed = time.perf_counter() - t_start
@@ -315,9 +426,14 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
         # message-passing graph, then re-forward. Stronger than zeroing the
         # hub's initial embedding (which gets reconstructed at layer 1+ from
         # the hub's incoming messages); cutting edges severs the hub entirely.
+        # Skip relations that don't touch `mid_node_type` — they share their
+        # original edge_index unchanged.
         masked_edge_index_dict = {}
         for et, ei in train_data.edge_index_dict.items():
             s_type, _, d_type = et
+            if s_type != mid_node_type and d_type != mid_node_type:
+                masked_edge_index_dict[et] = ei
+                continue
             keep = torch.ones(ei.shape[1], dtype=torch.bool, device=ei.device)
             if s_type == mid_node_type:
                 keep &= ei[0] != mid_node_idx
@@ -434,8 +550,22 @@ def main():
         print(f"WARNING: no checkpoint at {checkpoint}; attention weights and "
               f"fidelity numbers will be meaningless on an untrained model.")
 
+    print("\nExtracting per-edge attention weights (one-time)...")
+    t_attn = time.perf_counter()
+    all_layer_attentions = extract_attention_weights(model, train_data)
+    print(f"  done in {time.perf_counter() - t_attn:.1f}s")
+
+    print("Building edge-index lookup tables (one-time)...")
+    t_idx = time.perf_counter()
+    indexes = build_edge_indexes(train_data)
+    print(f"  done in {time.perf_counter() - t_idx:.1f}s")
+
     print(f"\nExplanation paths for user={args.user} -> track={args.track}:")
-    paths = find_explanation_path(model, train_data, args.user, args.track, top_k=5)
+    paths = find_explanation_path(
+        model, train_data, args.user, args.track, top_k=5,
+        precomputed_attentions=all_layer_attentions,
+        indexes=indexes,
+    )
 
     mappings_path = cfg.processed_data_dir / "id_mappings.json"
     mappings: dict = {}
@@ -459,7 +589,11 @@ def main():
             print(f"    {node_type}[{node_idx}] {label}")
 
     print(f"\nRunning fidelity test ({args.fidelity_samples} samples)...")
-    fidelity, coverage = fidelity_test(model, data, n_samples=args.fidelity_samples)
+    fidelity, coverage = fidelity_test(
+        model, data, n_samples=args.fidelity_samples,
+        precomputed_attentions=all_layer_attentions,
+        indexes=indexes,
+    )
     print(f"Fidelity score: {fidelity:.4f} (coverage: {coverage:.2%})")
     print("  fidelity   = fraction of testable samples where masking the hub "
           "node lowered the score")

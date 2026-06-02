@@ -24,7 +24,7 @@ from src.baselines import score_cold_user
 from src.build_graph import make_train_only_graph
 from src.config import Config
 from src.evaluate import compute_final_embeddings
-from src.explain import extract_attention_weights, find_explanation_path
+from src.explain import build_edge_indexes, extract_attention_weights, find_explanation_path
 from src.model import KGAT
 
 
@@ -96,9 +96,12 @@ def load_everything():
         for nt in ("user", "track", "artist", "playlist")
     }
 
-    # Pre-compute attentions once; reused on every selectbox change.
+    # Pre-compute attentions and edge-index lookups once; reused on every
+    # selectbox change (otherwise find_explanation_path rebuilds the ~3 GB
+    # lookup table on every UI interaction).
     with torch.no_grad():
         attentions = extract_attention_weights(model, train_data_dev)
+    indexes = build_edge_indexes(train_data_dev)
 
     return {
         "cfg": cfg,
@@ -113,6 +116,7 @@ def load_everything():
         "mappings": mappings,
         "idx_to_key": idx_to_key,
         "attentions": attentions,
+        "indexes": indexes,
         "device": device,
     }
 
@@ -255,6 +259,7 @@ def main():
         state["model"], state["train_data_dev"],
         int(user_idx), int(selected), top_k=5,
         precomputed_attentions=state["attentions"],
+        indexes=state["indexes"],
     )
     if not paths:
         st.info(
@@ -273,6 +278,15 @@ def main():
         st.write(f"{i}. **[{p['type']}]** {path_str}  *(attention {p['attention']:.4f})*")
 
     net = render_explanation_graph(paths, state["mappings"], state["idx_to_key"])
+    st.markdown(
+        '<div style="display:flex;gap:1.2em;font-size:0.9em;margin-bottom:0.4em;">'
+        '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#4CAF50;border-radius:50%;vertical-align:middle;"></span> user</span>'
+        '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#2196F3;border-radius:50%;vertical-align:middle;"></span> track</span>'
+        '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#FF9800;border-radius:50%;vertical-align:middle;"></span> artist</span>'
+        '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#9C27B0;border-radius:50%;vertical-align:middle;"></span> playlist</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
     with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
         html_path = Path(tmp.name)
     net.save_graph(str(html_path))
