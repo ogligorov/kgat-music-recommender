@@ -25,6 +25,7 @@ from src.build_graph import make_train_only_graph
 from src.config import Config
 from src.evaluate import compute_final_embeddings
 from src.explain import build_edge_indexes, extract_attention_weights, find_explanation_path
+from src.explain_text import render_paths_bg
 from src.model import KGAT
 
 
@@ -276,6 +277,15 @@ def main():
             for nt, idx in p["path"]
         )
         st.write(f"{i}. **[{p['type']}]** {path_str}  *(attention {p['attention']:.4f})*")
+
+    # Natural-language Bulgarian renderings of the top paths — one sentence 
+    # per path, template-driven (no LLM). Uses the same id_mappings as the
+    # path strings above so labels match.
+    sentences = render_paths_bg(paths, state["mappings"], state["idx_to_key"])
+    if sentences:
+        st.markdown("**Защо тези препоръки (на български):**")
+        for s in sentences:
+            st.markdown(f"- {s}")
 
     net = render_explanation_graph(paths, state["mappings"], state["idx_to_key"])
     st.markdown(
