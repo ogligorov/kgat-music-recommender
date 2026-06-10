@@ -1,95 +1,152 @@
-"""MPS + PyTorch Geometric compatibility smoke test.
+"""Smoke test: load the graph, instantiate KGAT, verify a forward path that fits in memory.
 
-Verifies the full stack works before any model code is written:
-1. MPS device availability
-2. GATConv forward + backward on MPS/CPU
-3. HeteroData construction
-4. NeighborLoader mini-batch sampling on heterogeneous graph
+Verifies:
+1. Device availability (CUDA → MPS → CPU)
+2. graph.pt loads with the expected 4 node types / 6 edge types
+3. Full-graph forward — attempted; OOM is expected at our scale and triggers fallback
+4. NeighborLoader sub-graph forward + backward works on the selected device
+5. Reports memory used by the sampled forward (CUDA / MPS only)
 """
 
 import torch
-from torch_geometric.data import HeteroData
 from torch_geometric.loader import NeighborLoader
-from torch_geometric.nn import GATConv
+
+from src.config import Config
+from src.model import KGAT, EDGE_TYPES
+
+EXPECTED_NODE_TYPES = {"user", "track", "artist", "playlist"}
 
 
 def check_device() -> str:
+    if torch.cuda.is_available():
+        x = torch.randn(4, 4, device="cuda")
+        _ = x @ x.T
+        name = torch.cuda.get_device_name(0)
+        print(f"[OK] CUDA available and functional ({name})")
+        return "cuda"
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         x = torch.randn(4, 4, device="mps")
         _ = x @ x.T
         print("[OK] MPS available and functional")
         return "mps"
-    print("[WARN] MPS not available, falling back to CPU")
+    print("[WARN] No GPU available, falling back to CPU")
     return "cpu"
 
 
-def check_gat_forward_backward(device: str) -> None:
-    conv = GATConv(16, 8, heads=4, concat=False).to(device)
-    x = torch.randn(20, 16, device=device)
-    edge_index = torch.randint(0, 20, (2, 50), device=device)
-
-    out = conv(x, edge_index)
-    assert out.shape == (20, 8), f"Unexpected shape: {out.shape}"
-
-    loss = out.sum()
-    loss.backward()
-    has_grad = any(p.grad is not None for p in conv.parameters())
-    assert has_grad, "No gradients computed"
-    print(f"[OK] GATConv forward + backward on {device}")
-
-
-def check_hetero_data(device: str) -> HeteroData:
-    data = HeteroData()
-    data["user"].x = torch.randn(10, 16)
-    data["artist"].x = torch.randn(30, 16)
-    data["tag"].x = torch.randn(20, 16)
-    data["era"].x = torch.randn(8, 16)
-
-    data["user", "listens_to", "artist"].edge_index = torch.randint(0, 10, (1, 40)).repeat(2, 1)
-    data["user", "listens_to", "artist"].edge_index[1] = torch.randint(0, 30, (40,))
-
-    data["artist", "tagged_with", "tag"].edge_index = torch.stack([
-        torch.randint(0, 30, (50,)),
-        torch.randint(0, 20, (50,)),
-    ])
-
-    data["artist", "active_in_era", "era"].edge_index = torch.stack([
-        torch.randint(0, 30, (30,)),
-        torch.randint(0, 8, (30,)),
-    ])
-
-    assert len(data.node_types) == 4
-    assert len(data.edge_types) == 3
-    print(f"[OK] HeteroData created: {len(data.node_types)} node types, {len(data.edge_types)} edge types")
-    return data
+def check_graph(cfg: Config):
+    path = cfg.processed_data_dir / "graph.pt"
+    data = torch.load(path, weights_only=False)
+    assert set(data.node_types) == EXPECTED_NODE_TYPES, (
+        f"Expected {EXPECTED_NODE_TYPES}, got {set(data.node_types)}"
+    )
+    assert set(data.edge_types) == set(EDGE_TYPES), (
+        f"Expected {len(EDGE_TYPES)} edge types, got {len(data.edge_types)}: {data.edge_types}"
+    )
+    liked = data["user", "liked", "track"]
+    for mask_name in ("train_mask", "val_mask", "test_mask"):
+        assert hasattr(liked, mask_name), f"Missing {mask_name} on (user, liked, track)"
+    n = {nt: data[nt].num_nodes for nt in data.node_types}
+    print("[OK] graph.pt schema verified")
+    print(f"     nodes: users={n['user']:,}  tracks={n['track']:,}  "
+          f"artists={n['artist']:,}  playlists={n['playlist']:,}")
+    return data, n
 
 
-def check_neighbor_loader(data: HeteroData) -> None:
+def try_full_graph_forward(model: KGAT, data, device: str) -> bool:
+    """Attempt a full-graph forward. Returns True on success, False on OOM.
+
+    OOM is expected at our scale and is the trigger for switching the trainer
+    to LinkNeighborLoader.
+    """
+    if device == "mps":
+        torch.mps.empty_cache()
+    elif device == "cuda":
+        torch.cuda.empty_cache()
+    try:
+        out = model(data)
+        for nt, t in out.items():
+            assert not torch.isnan(t).any(), f"{nt} embeddings contain NaN"
+        print("[OK] Full-graph forward fits in memory; can train without sampling.")
+        return True
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if "out of memory" in msg or "mps backend out of memory" in msg:
+            print("[INFO] Full-graph forward OOMs (expected at our scale).")
+            print("       -> Falling back to NeighborLoader-based training.")
+            if device == "mps":
+                torch.mps.empty_cache()
+            elif device == "cuda":
+                torch.cuda.empty_cache()
+            return False
+        raise
+
+
+def check_neighbor_loader_forward(model: KGAT, data, n: dict, device: str):
+    """Sample a sub-graph with NeighborLoader and run forward+backward through it."""
     loader = NeighborLoader(
         data,
-        num_neighbors=[5, 3],
+        num_neighbors=[10, 10, 5],
         input_nodes="user",
-        batch_size=4,
+        batch_size=256,
+        shuffle=True,
     )
-    batch = next(iter(loader))
-    assert "user" in batch.node_types
-    assert batch["user"].batch_size == 4
-    print(f"[OK] NeighborLoader produces mini-batches (batch_size=4, got {batch['user'].num_nodes} user nodes in subgraph)")
+    batch = next(iter(loader)).to(device)
+
+    out = model(batch)
+    for nt in EXPECTED_NODE_TYPES:
+        assert nt in out, f"Forward missing {nt}"
+        assert not torch.isnan(out[nt]).any(), f"{nt} embeddings contain NaN"
+    print(f"[OK] NeighborLoader sub-graph forward — non-NaN for all 4 node types")
+    print(f"     batch user nodes: {batch['user'].num_nodes:,}, "
+          f"track nodes: {batch['track'].num_nodes:,}")
+
+    # Dummy BPR backward over a few real positive (user, track) pairs in this sub-graph
+    seed_users = torch.arange(batch["user"].batch_size, device=device)
+    pos_track = torch.randint(0, batch["track"].num_nodes, (len(seed_users),), device=device)
+    neg_track = torch.randint(0, batch["track"].num_nodes, (len(seed_users),), device=device)
+    loss = model.bpr_loss(out["user"][seed_users], out["track"][pos_track], out["track"][neg_track])
+    loss.backward()
+    print(f"[OK] Backward completed, dummy BPR loss = {loss.item():.4f}")
+
+    if device == "mps":
+        cur_gb = torch.mps.current_allocated_memory() / (1024 ** 3)
+        recommended_gb = torch.mps.recommended_max_memory() / (1024 ** 3)
+        print(f"[INFO] MPS current allocated: {cur_gb:.2f} GB / recommended {recommended_gb:.2f} GB")
+    elif device == "cuda":
+        cur_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+        peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"[INFO] CUDA current allocated: {cur_gb:.2f} GB / peak {peak_gb:.2f} GB / total {total_gb:.2f} GB")
 
 
 def main():
-    print("=" * 50)
-    print("KGAT Music Recommender — Smoke Test")
-    print("=" * 50)
+    print("=" * 60)
+    print("KGAT — Smoke Test")
+    print("=" * 60)
 
+    cfg = Config()
     device = check_device()
-    check_gat_forward_backward(device)
-    data = check_hetero_data(device)
-    check_neighbor_loader(data)
+    data, n = check_graph(cfg)
 
-    print("=" * 50)
-    print(f"ALL CHECKS PASSED (device={device})")
-    print("=" * 50)
+    model = KGAT(
+        n_users=n["user"], n_tracks=n["track"],
+        n_artists=n["artist"], n_playlists=n["playlist"],
+        embed_dim=cfg.embed_dim, n_layers=cfg.n_layers,
+        mess_dropout=cfg.mess_dropout,
+        kge_dim=cfg.kge_dim, kge_reg=cfg.kge_reg,
+        leaky_relu_slope=cfg.leaky_relu_slope,
+    ).to(device)
+
+    full_graph_ok = try_full_graph_forward(model, data.to(device), device)
+    if not full_graph_ok:
+        # Move data back to CPU for the loader (it samples on CPU then ships to device)
+        data = data.to("cpu")
+        check_neighbor_loader_forward(model, data, n, device)
+
+    print("=" * 60)
+    print(f"ALL CHECKS PASSED (device={device}, "
+          f"full_graph={'yes' if full_graph_ok else 'no, using NeighborLoader'})")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
