@@ -1,6 +1,5 @@
 from collections import defaultdict
 
-import torch
 import pandas as pd
 
 GENRE_KEYWORDS = {

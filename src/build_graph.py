@@ -20,8 +20,6 @@ EXPECTED_COLUMNS = {"user_id", "artistname", "trackname", "playlistname"}
 
 
 def load_spotify_csv(path: Path) -> pd.DataFrame:
-    """Load the Spotify Playlists CSV. Header has leading-space-quoted columns,
-    so skipinitialspace=True is required. Drops malformed rows."""
     df = pd.read_csv(
         path,
         skipinitialspace=True,
@@ -97,7 +95,6 @@ def build_id_mappings(df: pd.DataFrame) -> dict:
     artist_to_idx = {a: i for i, a in enumerate(artist_keys)}
     playlist_to_idx = {p: i for i, p in enumerate(playlist_keys)}
 
-    # Display strings for the UI: pick the first observed casing for each canonical key
     track_display = (
         df.drop_duplicates("track_key")
         .set_index("track_key")[["artistname", "trackname"]]
@@ -122,7 +119,6 @@ def build_id_mappings(df: pd.DataFrame) -> dict:
 
 
 def build_edge_indices(df: pd.DataFrame, mappings: dict) -> dict:
-    """Build the three forward edge_index tensors. Reverse edges are added in main()."""
     # (user, liked, track): one edge per distinct (user, track) pair across all playlists
     liked = df[["user_id", "track_key"]].drop_duplicates()
     liked_src = liked["user_id"].map(mappings["user_to_idx"]).to_numpy(dtype=np.int64)
@@ -177,19 +173,10 @@ def split_interactions(
 def make_train_only_graph(
     data: HeteroData, mp_mask: torch.Tensor | None = None
 ) -> HeteroData:
-    """Build a HeteroData whose (user, liked, track) and (track, rev_liked, user)
+    """
+    Build a HeteroData whose (user, liked, track) and (track, rev_liked, user)
     edge_indices are filtered to a chosen subset. All other edge types and node
     counts are shared by reference.
-
-    PyG's `train_mask` is metadata: it is NOT applied automatically during
-    message passing. Forwarding `data` directly leaks val/test labels into
-    the GNN.
-
-    `mp_mask` controls which edges survive into the message-passing graph:
-      - None (default): use `train_mask`. Correct for evaluation.
-      - Custom bool mask of length |liked edges|: use during supervised training
-        to disjoint-split train edges into a message-passing pool (mp_mask=True)
-        and a supervision pool (mp_mask=False, fed as edge_label_index).
     """
     if mp_mask is None:
         mp_mask = data["user", "liked", "track"].train_mask

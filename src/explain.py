@@ -4,21 +4,19 @@ Two responsibilities:
   - `find_explanation_path` extracts top-k attention-weighted paths from a
     user to a recommended track. Three path types:
         * direct       : (user, liked, track) edge present in the train graph.
-        * via_artist   : user → track_A → artist → target_track, where track_A
+        * via_artist   : user -> track_A -> artist -> target_track, where track_A
                          is liked by the user and shares the target's artist.
-        * via_playlist : user → track_A → playlist → target_track, where the
+        * via_playlist : user -> track_A -> playlist -> target_track, where the
                          playlist contains both track_A and the target.
     Path score is the geometric mean of edge attentions along the path,
     head-averaged and layer-averaged.
   - `fidelity_test` masks the explanation's hub node (artist or playlist)
     and re-forwards. Reports the fraction of test pairs where the score drops.
-
-All forwards run on the train-only graph (`make_train_only_graph`) to match
-the message-passing the model actually saw at training time.
 """
 
 import json
 import time
+import argparse
 
 import torch
 import torch.nn.functional as F
@@ -29,9 +27,6 @@ from src.build_graph import make_train_only_graph
 from src.model import EDGE_TYPES, KGAT
 
 
-# Relations that `_get_edge_attention` and `find_explanation_path` look up by
-# (src, dst). Subset of `EDGE_TYPES` — only the ones queried for the three
-# path types. Kept in module scope so callers can introspect / cache.
 LOOKUP_EDGE_TYPES: tuple[tuple[str, str, str], ...] = (
     ("user", "liked", "track"),
     ("track", "performed_by", "artist"),
@@ -42,15 +37,6 @@ LOOKUP_EDGE_TYPES: tuple[tuple[str, str, str], ...] = (
 
 
 def build_edge_indexes(data: HeteroData) -> dict[tuple, dict[int, dict[int, int]]]:
-    """Per-relation `src -> {dst: edge_idx}` lookup tables. Used both to
-    enumerate candidate paths (user's liked tracks, target's playlists, etc.)
-    and to retrieve per-edge attention in O(1) instead of an O(E) edge_index
-    scan. One-time O(sum_E) build; ~3-4 GB peak for the full 17M-edge graph
-    (dominated by `liked`).
-
-    Duplicate (src, dst) edges are resolved by `setdefault` to keep the
-    first-occurrence index — matching the original `(ei[0]==s) & (ei[1]==d)`
-    + `[0]` semantics that this lookup replaces."""
     indexes: dict[tuple, dict[int, dict[int, int]]] = {}
     for et in LOOKUP_EDGE_TYPES:
         if et not in data.edge_types:
@@ -74,20 +60,7 @@ def build_edge_indexes(data: HeteroData) -> dict[tuple, dict[int, dict[int, int]
 
 
 def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple, torch.Tensor]]:
-    """Run a full forward and capture per-layer, per-edge-type attention,
-    aligned with `data[edge_type].edge_index` (one scalar per edge).
-
-    Replicates `KGAT.forward_one_layer` step by step so we can split the
-    post-softmax attention tensor back per relation. The softmax denominator
-    runs across all incoming relations to a destination, so per-relation
-    attention numbers are only meaningful AFTER the joint softmax.
-
-    To keep peak memory low, we never concatenate every relation's source
-    embeddings into a single `all_msgs` tensor: per-relation logits are
-    concatenated only for the joint softmax, then attention is sliced back
-    per relation and `index_add_`ed into the destination accumulator one
-    relation at a time.
-    """
+    """Run a full forward and capture per-layer, per-edge-type attention"""
     model.eval()
     x_dict = model.get_initial_embeddings(data)
     edge_index_dict = data.edge_index_dict
@@ -96,10 +69,6 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
 
     with torch.no_grad():
         for layer_idx in range(model.n_layers):
-            # Per-destination buffers. `rel_data` holds one entry per relation
-            # pointing to this dst: (edge_type, slice or None, x_src or None,
-            # dst_local or None). Empty relations carry `None`s so we can
-            # still emit a zero-length `layer_attn[et]` for them later.
             per_dst: dict[str, dict] = {
                 nt: {"logits": [], "rel_data": []}
                 for nt in x_dict
@@ -136,17 +105,11 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
                         layer_attn[et] = torch.zeros(0)
                     continue
                 all_logits = torch.cat(buf["logits"], dim=0)
-                # `rel_data` and `logits` are appended in lockstep in
-                # EDGE_TYPES order, so filtering `rel_data` by `sl is not None`
-                # yields dst tensors in the same order as `logits` — required
-                # for the joint softmax to align edges with their destinations.
                 all_dst = torch.cat(
                     [d for _, sl, _, d in buf["rel_data"] if sl is not None],
                     dim=0,
                 )
                 attn = softmax(all_logits, all_dst, num_nodes=n_dst)
-                # Per-relation scatter avoids materializing a single
-                # concatenated `all_msgs` (the original peak-memory hotspot).
                 first_x_src = next(x for _, sl, x, _ in buf["rel_data"] if sl is not None)
                 embed_dim = first_x_src.size(-1)
                 out = torch.zeros(
@@ -164,8 +127,6 @@ def extract_attention_weights(model: KGAT, data: HeteroData) -> list[dict[tuple,
 
             all_layer_attentions.append(layer_attn)
 
-            # GCN aggregator + dropout (off in eval) + L2-norm — the same chain
-            # forward() applies, so x_dict matches what the next layer sees.
             x_dict = {
                 nt: F.leaky_relu(model.W_gc[layer_idx](v), negative_slope=model.leaky_relu_slope)
                 for nt, v in out_dict.items()
@@ -182,9 +143,8 @@ def _get_edge_attention(
     dst_idx: int,
     indexes: dict[tuple, dict[int, dict[int, int]]],
 ) -> float:
-    """Mean attention across layers for the (src_idx → dst_idx) edge of
-    `edge_type`. O(1) lookup via the prebuilt `indexes` table. Returns 0.0
-    if the edge isn't in the graph."""
+    """Mean attention across layers for the (src_idx -> dst_idx) edge of
+    `edge_type`. Returns 0.0 if the edge isn't in the graph."""
     bucket = indexes.get(edge_type, {}).get(src_idx)
     if bucket is None:
         return 0.0
@@ -212,7 +172,7 @@ def find_explanation_path(
     precomputed_attentions: list[dict[tuple, torch.Tensor]] | None = None,
     indexes: dict[tuple, dict[int, dict[int, int]]] | None = None,
 ) -> list[dict]:
-    """Top-k paths user → target_track ranked by geometric-mean edge attention.
+    """Top-k paths user -> target_track ranked by geometric-mean edge attention.
 
     `data` should be the train-only graph (see `make_train_only_graph`); a
     direct edge will only register if it was in train, which is what we want
@@ -253,15 +213,9 @@ def find_explanation_path(
         paths.sort(key=lambda p: p["attention"], reverse=True)
         return paths[:top_k]
 
-    # via_artist: user → track_A → artist → target_track. Each track has one
-    # artist (one row in `performed_by` per track), so the only candidate
-    # mid-artist is the target's artist; we just check whether each user-liked
-    # track shares it.
+    # via_artist: user → track_A → artist → target_track
     target_artist_bucket = perf_idx.get(track_idx)
     if target_artist_bucket:
-        # next(iter(...)) matches the original "first edge_index occurrence"
-        # behavior because `build_edge_indexes` inserts in edge_index order
-        # and dict iteration is insertion-ordered (Python 3.7+).
         target_artist = next(iter(target_artist_bucket))
         for track_a in user_tracks:
             if track_a == track_idx:
@@ -292,9 +246,7 @@ def find_explanation_path(
                 "attention": (a1 * a2 * a3) ** (1 / 3),
             })
 
-    # via_playlist: user → track_A → playlist → target_track. A playlist
-    # qualifies if it contains both track_A and the target. Many tracks live
-    # on dozens of playlists, so cap shared playlists per (track_a) pair.
+    # via_playlist: user → track_A → playlist → target_track
     target_pl_bucket = in_pl_idx.get(track_idx, {})
     target_playlists = set(target_pl_bucket.keys())
     if target_playlists:
@@ -339,18 +291,10 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
                   ) -> tuple[float, float]:
     """For sampled (user, target_track) test edges, find the top explanation
     path; if it's via_artist or via_playlist, drop every edge incident on the
-    hub node from the message-passing graph and re-forward. Fidelity =
-    fraction of samples where the masked score is lower than the original.
+    hub node from the message-passing graph and re-forward. 
+    Fidelity = fraction of samples where the masked score is lower than the original.
     `data` is the FULL graph (we need test_mask); message passing happens on
     the train-only graph.
-
-    Pass `precomputed_attentions` and `indexes` to skip the (expensive)
-    one-time attention extraction and edge-index lookup table builds — both
-    can be reused across calls. **Both must have been built against the
-    same train-only graph derived from `data`** (i.e. the output of
-    `make_train_only_graph(data)`); silent corruption will result if they
-    were built against a different graph (e.g. the full graph). A cheap
-    edge-count sanity check is performed up front.
 
     Returns (fidelity, coverage):
       fidelity = changes / total
@@ -370,9 +314,6 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
     if precomputed_attentions is None:
         precomputed_attentions = extract_attention_weights(model, train_data)
     else:
-        # Sanity: per-layer attention vectors should have one entry per edge
-        # in `train_data` for every populated relation. Catches the common
-        # mistake of passing attentions built from the full graph.
         first_layer = precomputed_attentions[0]
         for et in EDGE_TYPES:
             n_edges = train_data[et].edge_index.shape[1] if et in train_data.edge_types else 0
@@ -425,9 +366,7 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
         # Edge-level masking: drop every edge incident on the hub from the
         # message-passing graph, then re-forward. Stronger than zeroing the
         # hub's initial embedding (which gets reconstructed at layer 1+ from
-        # the hub's incoming messages); cutting edges severs the hub entirely.
-        # Skip relations that don't touch `mid_node_type` — they share their
-        # original edge_index unchanged.
+        # the hub's incoming messages), cutting edges severs the hub entirely.
         masked_edge_index_dict = {}
         for et, ei in train_data.edge_index_dict.items():
             s_type, _, d_type = et
@@ -491,8 +430,6 @@ def _label_for(node_type: str, node_idx: int, mappings: dict, idx_to_key: dict) 
 
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--user", type=int, default=0)
     parser.add_argument("--track", type=int, default=5)
@@ -504,8 +441,6 @@ def main():
     from src.config import Config
 
     cfg = Config()
-    # Full-graph attention extraction OOMs on consumer GPUs at this scale (17M
-    # edges × 6 relations). CPU is slower but reliable.
     device = torch.device("cpu")
 
     print(f"Loading graph from {cfg.processed_data_dir / 'graph.pt'}...")
@@ -525,17 +460,12 @@ def main():
         leaky_relu_slope=cfg.leaky_relu_slope,
     ).to(device)
 
-    # Initialize lazy params via one tiny sub-graph forward. NeighborLoader
-    # requires CPU tensors (MPS lacks CSR conversion), so we sample on CPU
-    # and move the batch to device.
     init_loader = NeighborLoader(
         train_data, num_neighbors=[3, 3, 3], input_nodes="user", batch_size=8,
     )
     with torch.no_grad():
         model(next(iter(init_loader)).to(device))
 
-    # Move the train-only graph to device for find_explanation_path /
-    # fidelity_test forwards.
     train_data = train_data.to(device)
 
     checkpoint = cfg.processed_data_dir / "kgat_best.pt"

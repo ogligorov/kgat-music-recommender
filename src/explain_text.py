@@ -4,12 +4,8 @@ Takes the structured path dicts produced by `find_explanation_path` and
 turns each into one sentence describing why the target track was
 recommended. Three path types map to three sentence templates:
 
-  * direct       — "...защото вече си харесал X."
-  * via_artist   — "...защото си харесал X, която е от същия артист — Y."
+  * via_artist   — "...защото си харесал X, която e от същия артист — Y."
   * via_playlist — "...защото си харесал X, която споделя плейлиста *Y*..."
-
-Pure templates; no LLM dependency. The `mappings` / `idx_to_key` arguments
-come straight from `app.py`'s cached state — same shape as in `explain.py`.
 """
 
 from collections.abc import Mapping

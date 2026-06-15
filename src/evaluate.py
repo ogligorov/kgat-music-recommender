@@ -97,10 +97,8 @@ def evaluate_model(
     verbose: bool = True,
     cfg: Config | None = None,
 ) -> dict:
-    """Sampled-metrics NDCG@K and Recall@K.
-
-    Pass `cfg` to override n_eval_users / n_eval_negatives without mutating
-    the global default.
+    """
+    Sampled-metrics NDCG@K and Recall@K.
     """
     assert split in ("val", "test"), f"split must be 'val' or 'test', got {split!r}"
 
@@ -110,16 +108,12 @@ def evaluate_model(
     was_training = model.training
     model.eval()
     rng = np.random.default_rng(seed)
-    # PyG's NeighborLoader uses the torch global RNG for neighbor sampling.
-    # Seed both numpy (user / neg_pool sampling) and torch (sampler) for
-    # end-to-end reproducibility.
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
     timings: dict[str, float] = {}
 
-    # Train-only graph for message passing — val/test edges must not reach the GNN.
     t0 = time.perf_counter()
     train_data = make_train_only_graph(data)
     timings["train_data"] = time.perf_counter() - t0
@@ -149,20 +143,16 @@ def evaluate_model(
     eligible.sort()
     eligible_list = eligible.tolist()
 
-    # Shared neg_pool. Per-user candidate = (gt_u) ∪ (neg_pool \ train_pos_u \ gt_u).
-    # Clamp to n_tracks so rng.choice(replace=False) doesn't raise on small datasets.
     neg_pool_size = min(cfg.n_eval_negatives, n_tracks)
     neg_pool = rng.choice(n_tracks, size=neg_pool_size, replace=False)
     neg_pool_set: set[int] = {int(t) for t in neg_pool}
 
-    # Embedding pool = union of every user's candidate set = neg_pool ∪ all eligible gt.
     candidate_set: set[int] = set(neg_pool_set)
     for u in eligible_list:
         candidate_set.update(eval_gt_per_user[u])
     candidate_tracks = sorted(candidate_set)
     track_idx_map = {t: i for i, t in enumerate(candidate_tracks)}
 
-    # Per-user candidate column positions within the union.
     user_cand_cols: list[torch.Tensor] = []
     for uid in eligible_list:
         gt = eval_gt_per_user[uid]
@@ -227,8 +217,6 @@ def evaluate_model(
 
 
 def main():
-    """Plumbing check: untrained model + sampled scoring should run quickly.
-    Metrics are meaningless without training — this just exercises the path."""
     import time
 
     cfg = Config()
@@ -249,7 +237,6 @@ def main():
         leaky_relu_slope=cfg.leaky_relu_slope,
     ).to(device)
 
-    # Initialize lazy params via one tiny sub-graph forward (train-only graph).
     train_data = make_train_only_graph(data)
     init_loader = NeighborLoader(
         train_data, num_neighbors=[5, 5, 5], input_nodes="user", batch_size=8,

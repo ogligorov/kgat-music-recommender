@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=1.24",
     "streamlit>=1.30",
     "pyvis>=0.3",
+    "dotenv"
 ]
 
 # pyg-lib / torch-sparse are NOT listed here. They are PyG sampler backends

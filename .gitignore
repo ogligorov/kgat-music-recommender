@@ -21,3 +21,4 @@ data/spotify_dataset.csv
 # OS
 .DS_Store
 Thumbs.db
+.env
