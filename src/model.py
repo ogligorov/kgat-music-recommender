@@ -150,7 +150,7 @@ class KGAT(nn.Module):
             weighted = all_msgs * attn.unsqueeze(-1)
             out_dict[nt] = scatter(weighted, all_dst, dim=0, dim_size=n_dst, reduce="sum")
 
-        # GCN aggregator: LeakyReLU(W_gc^(l) · agg)
+        # GCN aggregator: LeakyReLU(W_gc^(l) * agg).
         out_dict = {
             nt: F.leaky_relu(self.W_gc[layer_idx](v), negative_slope=self.leaky_relu_slope)
             for nt, v in out_dict.items()

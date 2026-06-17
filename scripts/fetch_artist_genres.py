@@ -1,14 +1,3 @@
-"""Fetch artist genre tags from Last.fm with MusicBrainz fallback.
-
-Reads artist IDs from data/processed/id_mappings.json, filters to artists
-with >= MIN_TRACK_COUNT tracks in the graph (others won't surface in top-K),
-queries Last.fm artist.gettoptags concurrently, keeps tags with count >= 20,
-and falls back to MusicBrainz for artists with fewer than 2 Last.fm tags.
-Writes data/processed/artist_genres.json keyed by artist_lc. Resumable.
-"""
-
-from __future__ import annotations
-
 import argparse
 import collections
 import json
@@ -38,7 +27,7 @@ MUSICBRAINZ_URL = "https://musicbrainz.org/ws/2/artist"
 LASTFM_TAG_MIN_COUNT = 20
 LASTFM_MIN_TAGS = 2
 MB_MIN_SCORE = 80
-MIN_TRACK_COUNT = 5     # skip artists with fewer tracks in the graph
+MIN_TRACK_COUNT = 5 # skip artists with fewer tracks in the graph
 WORKERS = 4
 PROGRESS_EVERY = 100
 

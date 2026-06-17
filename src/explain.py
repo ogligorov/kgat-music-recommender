@@ -22,7 +22,10 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
 from torch_geometric.utils import softmax
+from torch_geometric.loader import NeighborLoader
 
+from src.config import Config
+    
 from src.build_graph import make_train_only_graph
 from src.model import EDGE_TYPES, KGAT
 
@@ -172,14 +175,6 @@ def find_explanation_path(
     precomputed_attentions: list[dict[tuple, torch.Tensor]] | None = None,
     indexes: dict[tuple, dict[int, dict[int, int]]] | None = None,
 ) -> list[dict]:
-    """Top-k paths user -> target_track ranked by geometric-mean edge attention.
-
-    `data` should be the train-only graph (see `make_train_only_graph`); a
-    direct edge will only register if it was in train, which is what we want
-    when explaining a held-out recommendation.
-
-    Pass `precomputed_attentions` and `indexes` to skip per-call rebuilds —
-    both are reusable across users when the message-passing graph is fixed."""
     all_layer_attentions = precomputed_attentions or extract_attention_weights(model, data)
     if indexes is None:
         indexes = build_edge_indexes(data)
@@ -191,8 +186,6 @@ def find_explanation_path(
 
     user_liked = liked_idx.get(user_idx, {})
 
-    # 1-hop direct edge. Use the same cross-layer mean as via_artist /
-    # via_playlist so direct-path scores are comparable to multi-hop ones.
     if track_idx in user_liked:
         attn = _get_edge_attention(
             all_layer_attentions, ("user", "liked", "track"),
@@ -205,15 +198,14 @@ def find_explanation_path(
             "attention": attn,
         })
 
-    # User's liked tracks — capped for tractability on power users. Sort
-    # for deterministic ordering across runs (dict insertion order would
-    # otherwise leak edge_index ordering into the cap).
+    # User's liked tracks — capped for tractability on power users. 
+    # Sorted for deterministic ordering across runs
     user_tracks = sorted(user_liked.keys())[:max_user_tracks]
     if not user_tracks:
         paths.sort(key=lambda p: p["attention"], reverse=True)
         return paths[:top_k]
 
-    # via_artist: user → track_A → artist → target_track
+    # via_artist: user -> track_A -> artist -> target_track.
     target_artist_bucket = perf_idx.get(track_idx)
     if target_artist_bucket:
         target_artist = next(iter(target_artist_bucket))
@@ -246,7 +238,6 @@ def find_explanation_path(
                 "attention": (a1 * a2 * a3) ** (1 / 3),
             })
 
-    # via_playlist: user → track_A → playlist → target_track
     target_pl_bucket = in_pl_idx.get(track_idx, {})
     target_playlists = set(target_pl_bucket.keys())
     if target_playlists:
@@ -290,7 +281,7 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
                   indexes: dict[tuple, dict[int, dict[int, int]]] | None = None,
                   ) -> tuple[float, float]:
     """For sampled (user, target_track) test edges, find the top explanation
-    path; if it's via_artist or via_playlist, drop every edge incident on the
+    path, if it's via_artist or via_playlist, drop every edge incident on the
     hub node from the message-passing graph and re-forward. 
     Fidelity = fraction of samples where the masked score is lower than the original.
     `data` is the FULL graph (we need test_mask); message passing happens on
@@ -357,7 +348,6 @@ def fidelity_test(model: KGAT, data: HeteroData, n_samples: int = 100,
                   f"(elapsed {elapsed:.0f}s, ETA {eta:.0f}s)", flush=True)
             continue
 
-        # Hub node sits at index 2 in via_artist / via_playlist paths.
         path = paths[0]["path"]
         if len(path) < 4:
             continue
@@ -435,10 +425,6 @@ def main():
     parser.add_argument("--track", type=int, default=5)
     parser.add_argument("--fidelity-samples", type=int, default=100)
     args = parser.parse_args()
-
-    from torch_geometric.loader import NeighborLoader
-
-    from src.config import Config
 
     cfg = Config()
     device = torch.device("cpu")

@@ -46,7 +46,6 @@ def render_path_bg(
     path = path_info["path"]
     ptype = path_info["type"]
 
-    # All path types end at the target track — last element.
     target_track = _track_label(path[-1][1], mappings, idx_to_key)
 
     if ptype == "direct":
@@ -76,7 +75,6 @@ def render_path_bg(
             f"*\"{playlist}\"*."
         )
 
-    # Unknown path type — fall back to the raw chain so we still say something.
     return f"Препоръчваме **{target_track}**."
 
 

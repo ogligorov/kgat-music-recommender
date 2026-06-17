@@ -217,8 +217,6 @@ def evaluate_model(
 
 
 def main():
-    import time
-
     cfg = Config()
     device = torch.device(cfg.device)
     print(f"Loading graph from {cfg.processed_data_dir / 'graph.pt'}...")

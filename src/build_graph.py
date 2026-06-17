@@ -31,14 +31,12 @@ def load_spotify_csv(path: Path) -> pd.DataFrame:
         raise ValueError(f"CSV missing expected columns: {missing}; found {df.columns.tolist()}")
     df = df.dropna(subset=["user_id", "artistname", "trackname", "playlistname"])
 
-    # Lowercase + strip for dedup
     df["artist_lc"] = df["artistname"].str.lower().str.strip()
     df["track_lc"] = df["trackname"].str.lower().str.strip()
     df["playlist_lc"] = df["playlistname"].str.lower().str.strip()
 
     df = df[(df["artist_lc"] != "") & (df["track_lc"] != "") & (df["playlist_lc"] != "")]
 
-    # Composite keys for grouping
     df["track_key"] = df["artist_lc"] + "|||" + df["track_lc"]
     df["playlist_key"] = df["user_id"] + "|||" + df["playlist_lc"]
     return df
@@ -252,7 +250,6 @@ def main():
     graph_path = cfg.processed_data_dir / "graph.pt"
     torch.save(data, graph_path)
 
-    # Persist mappings (keys can be tuples-as-strings; store a JSON-safe form)
     mappings_serializable = {
         "user_to_idx": mappings["user_to_idx"],
         "track_to_idx": mappings["track_to_idx"],

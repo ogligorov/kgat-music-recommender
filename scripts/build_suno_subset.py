@@ -1,9 +1,3 @@
-"""Build a stratified Suno subset for the AI-music extension demo.
-
-Reads the pre-downloaded nyuuzyou/suno parquet file, applies quality filters,
-assigns a canonical genre via substring matching on metadata_tags, then keeps
-the top-600 tracks per genre bucket by upvote_count.
-"""
 from pathlib import Path
 
 import pandas as pd

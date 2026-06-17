@@ -1,10 +1,3 @@
-"""Baseline recommenders for comparison.
-
-Track-popularity baseline mirrors the sampled-metrics protocol from
-evaluate.py so KGAT vs. baseline numbers are directly comparable
-(same eligible users, same per-user candidate sets, same train-positive masking).
-"""
-
 import numpy as np
 import torch
 from torch_geometric.data import HeteroData

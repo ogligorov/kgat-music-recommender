@@ -1,16 +1,3 @@
-"""Streamlit demo for the KGAT music recommender.
-
-Loads the trained KGAT (4 node types: user/track/artist/playlist; 6 directed
-relations; TransR attention) and the popularity baseline. Picks a user,
-shows KGAT top-K tracks vs. popularity top-K, and lets the user inspect
-explanation paths (direct / via_artist / via_playlist) for any recommended
-track.
-
-Embedding the full corpus (14k users × 381k tracks) is wrapped in
-@st.cache_resource so it runs once per process. Per-user scoring after
-that is a single matmul.
-"""
-
 import json
 import tempfile
 from pathlib import Path
@@ -34,7 +21,6 @@ from src.model import KGAT
 @st.cache_resource(show_spinner="Loading graph + model + embeddings (one-time, ~1 min)...")
 def load_everything():
     cfg = Config()
-    # MPS lacks aten::_convert_indices_from_coo_to_csr, which PyG NeighborLoader needs.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     data = torch.load(cfg.processed_data_dir / "graph.pt", weights_only=False)
@@ -107,9 +93,6 @@ def load_everything():
     suno_path = cfg.processed_data_dir / "suno_subset.parquet"
     suno_df = pd.read_parquet(suno_path) if suno_path.exists() else pd.DataFrame()
 
-    # Pre-compute attentions and edge-index lookups once; reused on every
-    # selectbox change (otherwise find_explanation_path rebuilds the ~3 GB
-    # lookup table on every UI interaction).
     with torch.no_grad():
         attentions = extract_attention_weights(model, train_data_dev)
     indexes = build_edge_indexes(train_data_dev)
