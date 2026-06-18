@@ -52,11 +52,8 @@ class Config:
 
     # Evaluation
     top_k: list[int] = field(default_factory=lambda: [10, 20])
-    eval_user_batch_size: int = 128       # for the user x track scoring chunks
+    eval_user_batch_size: int = 128
     eval_inference_batch_size: int = 1024  # for the no-grad NeighborLoader embedding passes
-    # Sampled metrics: per eval pass, sample this many users and score each
-    # against (their eval positives) + (a shared pool of negative tracks).
-    # Final eval uses larger numbers.
     n_eval_users: int = 500
     n_eval_negatives: int = 1000
 

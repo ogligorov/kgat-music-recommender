@@ -1,23 +1,3 @@
-"""Training loop for KGAT with BPR loss, using LinkNeighborLoader over (user, liked, track) edges.
-
-Negative sampling and message-passing leak prevention:
-
-  - Negative sampling is delegated to PyG's `NegativeSampling(mode="triplet")`
-    so each positive (u, t+) is paired with a randomly-corrupted dst (u, t-)
-    that shares the same user. The triplet API exposes aligned `src_index`,
-    `dst_pos_index`, `dst_neg_index`.
-
-  - `LinkNeighborLoader` does NOT auto-strip supervision edges from the
-    message-passing graph. If every train edge is both an MP edge AND a
-    supervision seed, the loader samples the seed (u, t+) edge as a 1-hop
-    neighbor of u and the model trivially copies t+'s embedding into u.
-
-    Fix: disjoint-split the train edges. 70% become MP-only (loader's
-    edge_index, used purely for message passing), 30% become supervision-only
-    (loader's edge_label_index, never appearing in the MP graph). Deterministic
-    via a fixed RNG seed.
-"""
-
 import time
 
 import torch
@@ -33,15 +13,12 @@ from src.model import EDGE_TYPES, KGAT
 def train_epoch(model, loader, optimizer, device, max_batches: int | None = None,
                 heartbeat_every: int = 50, epoch_label: str = "") -> float:
     model.train()
-    # Accumulate loss on-device. `.item()` is only called at heartbeat and
-    # end-of-epoch; per-batch `.item()` would force an MPS sync.
     total_loss_t = torch.zeros((), device=device)
     n_batches = 0
     total = max_batches if max_batches is not None else len(loader)
 
     t_epoch_start = time.perf_counter()
 
-    # Sync between phases for the first 3 debug batches to attribute timings.
     is_mps = device.type == "mps"
 
     def sync():
@@ -83,11 +60,6 @@ def train_epoch(model, loader, optimizer, device, max_batches: int | None = None
             sync()
             phases["forward"] = time.perf_counter() - t
 
-        # NegativeSampling(mode="triplet", amount=1) exposes the seed as three
-        # aligned local-index tensors. In HETEROGENEOUS mode PyG attaches them
-        # to the node stores: src_index on the source node type,
-        # dst_pos_index/dst_neg_index on the dst node type. The user is the
-        # same for the pos and neg pair by construction (dst-only corruption).
         src_local = batch["user"].src_index
         pos_track_local = batch["track"].dst_pos_index
         neg_track_local = batch["track"].dst_neg_index
@@ -147,9 +119,6 @@ def train_epoch(model, loader, optimizer, device, max_batches: int | None = None
 def disjoint_mp_sup_split(
     train_mask: torch.Tensor, sup_ratio: float = 0.3, seed: int = 42
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split a train_mask of shape (E,) into (mp_mask, sup_mask), both of
-    shape (E,), disjoint, summing to train_mask. `sup_ratio` of train edges
-    go to supervision-only. Deterministic via `seed` for reproducible runs."""
     train_idx = train_mask.nonzero(as_tuple=True)[0]
     n_train = train_idx.numel()
     n_sup = int(n_train * sup_ratio)
@@ -165,17 +134,6 @@ def disjoint_mp_sup_split(
 
 
 def build_kge_triples(data, train_mask: torch.Tensor) -> list[torch.Tensor]:
-    """Per-relation training triples for KGE Phase II.
-
-    Returns a list of length len(EDGE_TYPES); entry r is a [2, E_r] tensor of
-    (h_global, t_pos_global) pairs. (user, liked, track) and its reverse use
-    only train edges (val/test held out). Pure-KG relations (track↔artist,
-    track↔playlist) have no split — every edge is a training triple.
-
-    All 6 relations participate so W_r[liked] / relation_emb[liked] get
-    direct gradient signal. KGE has no GNN forward, so supervision-only
-    edges carry no leak risk.
-    """
     triples: list[torch.Tensor] = []
     liked_et = ("user", "liked", "track")
     rev_liked_et = ("track", "rev_liked", "user")
@@ -194,10 +152,6 @@ def train_epoch_kge(
     batch_size_kg: int, device, max_batches_per_relation: int | None = None,
     epoch_label: str = "",
 ) -> float:
-    """One full pass over KG triples. Iterates relations sequentially, sampling
-    `batch_size_kg` rows at a time; corrupts the tail uniformly within tail
-    type. Single optimizer step per batch. Returns mean loss across relations,
-    weighted by # of batches per relation."""
     model.train()
     total_loss_t = torch.zeros((), device=device)
     n_batches = 0
@@ -214,15 +168,12 @@ def train_epoch_kge(
         if max_batches_per_relation is not None:
             n_steps = min(n_steps, max_batches_per_relation)
 
-        # Permutation per epoch — KG triples shuffled each epoch.
         perm = torch.randperm(n_edges)
 
         for step in range(n_steps):
             sl = perm[step * batch_size_kg : (step + 1) * batch_size_kg]
             h = ei[0, sl].to(device)
             t_pos = ei[1, sl].to(device)
-            # Uniform tail corruption within the tail type. Collisions with
-            # positives are not rejected — rare enough at this scale.
             t_neg = torch.randint(0, n_t, (sl.numel(),), device=device)
 
             loss = model.kge_loss_one_relation(r_idx, h, t_pos, t_neg)
@@ -261,8 +212,7 @@ def main():
     data = torch.load(graph_path, weights_only=False)
     print(f"  loaded in {time.perf_counter() - t0:.1f}s", flush=True)
 
-    # Disjoint MP/supervision split within train edges: 30% supervision-only,
-    # 70% message-passing.
+    # Disjoint MP/supervision split within train edges: 70% message-passing, 30% supervision
     liked = data["user", "liked", "track"]
     train_mask = liked.train_mask
     mp_mask, sup_mask = disjoint_mp_sup_split(train_mask, sup_ratio=0.3, seed=42)
@@ -302,22 +252,14 @@ def main():
     print(f"Device: {cfg.device}, Layers: {cfg.n_layers}, Embed dim: {cfg.embed_dim}, "
           f"Out dim: {model.out_dim}", flush=True)
 
-    # AdamW: Adam with decoupled weight decay (effective L2 on parameters).
-    # Single optimizer for both phases.
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    # Supervision seeds = train edges NOT in the MP graph. By construction
-    # they cannot appear as neighbors when sampling around themselves.
     sup_edges = liked.edge_index[:, sup_mask]
 
     print(f"Constructing LinkNeighborLoader (batch_size={cfg.batch_size}, "
           f"num_neighbors={cfg.num_neighbors}, neg_sampling=triplet/amount=1)...", flush=True)
     t0 = time.perf_counter()
-    # NegativeSampling(mode="triplet", amount=1) corrupts the dst only — each
-    # positive (u, t+) yields a (u, t-) with t- a uniform random track. PyG
-    # attaches src_index, dst_pos_index, dst_neg_index to the seed storage.
-    # Residual collisions (t- happens to be a true positive for u) are
-    # negligible at this corpus size.
+
     loader = LinkNeighborLoader(
         train_data,
         num_neighbors=cfg.num_neighbors,
@@ -334,10 +276,6 @@ def main():
           f"capping to {actual_batches_per_epoch:,} per epoch "
           f"(edges_per_epoch={cfg.edges_per_epoch:,})", flush=True)
 
-    # KGE triple table. Built once on CPU; per-epoch indices are shuffled and
-    # batches shipped to device on demand. All 6 relations participate so
-    # W_r[liked] / relation_emb[liked] get direct gradient signal. Uses the
-    # full train_mask (KGE has no GNN forward → no leak risk).
     kge_triples = build_kge_triples(data, train_mask)
     type_sizes = {"user": n_users, "track": n_tracks,
                   "artist": n_artists, "playlist": n_playlists}
@@ -351,9 +289,7 @@ def main():
     start_epoch = 1
     checkpoint_path = cfg.processed_data_dir / "kgat_best.pt"
 
-    # Resume: model weights always restored; optimizer + best_ndcg + last
-    # epoch only if the checkpoint is in dict format. Legacy raw-state-dict
-    # checkpoints load weights only and we run a seeding eval below.
+    # Resume restores the model weights from a previous run
     resume_legacy = False
     if args.resume:
         if not checkpoint_path.exists():
@@ -372,7 +308,6 @@ def main():
             else:
                 model.load_state_dict(ckpt)
                 resume_legacy = True
-                # Back up the legacy file before any save can overwrite it.
                 import shutil
                 backup_path = checkpoint_path.with_name(
                     checkpoint_path.stem + "_legacy_backup.pt"
@@ -383,8 +318,6 @@ def main():
                 print(f"Resumed model weights from {checkpoint_path} "
                       f"(legacy format — running an eval to seed best_ndcg).",
                       flush=True)
-                # Seed best_ndcg with the loaded model's eval score so we only
-                # overwrite the checkpoint if a future epoch beats it.
                 seed_metrics = evaluate_model(model, data, cfg.top_k, verbose=False)
                 best_ndcg = seed_metrics["ndcg"][10]
                 print(f"  seeded best NDCG@10 = {best_ndcg:.4f} from loaded weights",
@@ -396,7 +329,6 @@ def main():
     # Cold-start: W_r and relation_emb are Xavier-init at epoch 1 — attention
     # is near-uniform until KGE has shaped them. One KGE warmup pass before
     # the first CF epoch gives the attention something to differentiate on.
-    # Skip on resume: loaded W_r / relation_emb are already shaped.
     if start_epoch == 1 and not args.resume:
         print("KGE warmup before first CF epoch...", flush=True)
         t0 = time.perf_counter()
@@ -444,7 +376,6 @@ def main():
             if ndcg_10 > best_ndcg:
                 best_ndcg = ndcg_10
                 patience_counter = 0
-                # Dict format so --resume can pick up optimizer state and epoch.
                 torch.save({
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),

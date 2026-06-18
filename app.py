@@ -1,20 +1,8 @@
-"""Streamlit demo for the KGAT music recommender.
-
-Loads the trained KGAT (4 node types: user/track/artist/playlist; 6 directed
-relations; TransR attention) and the popularity baseline. Picks a user,
-shows KGAT top-K tracks vs. popularity top-K, and lets the user inspect
-explanation paths (direct / via_artist / via_playlist) for any recommended
-track.
-
-Embedding the full corpus (14k users × 381k tracks) is wrapped in
-@st.cache_resource so it runs once per process. Per-user scoring after
-that is a single matmul.
-"""
-
 import json
 import tempfile
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 import torch
 from pyvis.network import Network
@@ -26,13 +14,13 @@ from src.config import Config
 from src.evaluate import compute_final_embeddings
 from src.explain import build_edge_indexes, extract_attention_weights, find_explanation_path
 from src.explain_text import render_paths_bg
+from src.genre_bridge import _clean_tags, explain_suno_recs, get_user_genre_profile, query_suno
 from src.model import KGAT
 
 
 @st.cache_resource(show_spinner="Loading graph + model + embeddings (one-time, ~1 min)...")
 def load_everything():
     cfg = Config()
-    # MPS lacks aten::_convert_indices_from_coo_to_csr, which PyG NeighborLoader needs.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     data = torch.load(cfg.processed_data_dir / "graph.pt", weights_only=False)
@@ -80,6 +68,9 @@ def load_everything():
         model, train_data, "track", cfg, device,
         input_nodes=torch.arange(n_tracks),
     )
+    artist_emb = compute_final_embeddings(
+        model, train_data, "artist", cfg, device,
+    )
 
     # Popularity vector over train edges only.
     liked = data["user", "liked", "track"]
@@ -97,9 +88,11 @@ def load_everything():
         for nt in ("user", "track", "artist", "playlist")
     }
 
-    # Pre-compute attentions and edge-index lookups once; reused on every
-    # selectbox change (otherwise find_explanation_path rebuilds the ~3 GB
-    # lookup table on every UI interaction).
+    genres_path = cfg.processed_data_dir / "artist_genres.json"
+    artist_genres = json.load(open(genres_path)) if genres_path.exists() else {}
+    suno_path = cfg.processed_data_dir / "suno_subset.parquet"
+    suno_df = pd.read_parquet(suno_path) if suno_path.exists() else pd.DataFrame()
+
     with torch.no_grad():
         attentions = extract_attention_weights(model, train_data_dev)
     indexes = build_edge_indexes(train_data_dev)
@@ -112,10 +105,13 @@ def load_everything():
         "model": model,
         "user_emb": user_emb,
         "track_emb": track_emb,
+        "artist_emb": artist_emb,
         "track_pop": track_pop,
         "train_pos_per_user": train_pos_per_user,
         "mappings": mappings,
         "idx_to_key": idx_to_key,
+        "artist_genres": artist_genres,
+        "suno_df": suno_df,
         "attentions": attentions,
         "indexes": indexes,
         "device": device,
@@ -228,81 +224,100 @@ def main():
         cold_top = score_cold_user(state["data"], top_k=top_k)
         for i, t in enumerate(cold_top, 1):
             st.write(f"**{i}.** {track_label(t, state['mappings'], state['idx_to_key'])}")
-        return
+    else:
+        train_pos = state["train_pos_per_user"][user_idx]
+        kgat_idx, kgat_scores = kgat_topk(state["user_emb"], state["track_emb"],
+                                           user_idx, train_pos, top_k)
+        pop_idx = popularity_topk(state["track_pop"], train_pos, top_k)
 
-    train_pos = state["train_pos_per_user"][user_idx]
-    kgat_idx, kgat_scores = kgat_topk(state["user_emb"], state["track_emb"],
-                                       user_idx, train_pos, top_k)
-    pop_idx = popularity_topk(state["track_pop"], train_pos, top_k)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("KGAT")
+            for i, (idx, score) in enumerate(zip(kgat_idx.tolist(), kgat_scores.tolist()), 1):
+                st.write(f"**{i}.** {track_label(idx, state['mappings'], state['idx_to_key'])} "
+                         f"  *(score {score:.3f})*")
+        with col2:
+            st.subheader("Popularity baseline")
+            for i, idx in enumerate(pop_idx.tolist(), 1):
+                st.write(f"**{i}.** {track_label(idx, state['mappings'], state['idx_to_key'])}")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("KGAT")
-        for i, (idx, score) in enumerate(zip(kgat_idx.tolist(), kgat_scores.tolist()), 1):
-            st.write(f"**{i}.** {track_label(idx, state['mappings'], state['idx_to_key'])} "
-                     f"  *(score {score:.3f})*")
-    with col2:
-        st.subheader("Popularity baseline")
-        for i, idx in enumerate(pop_idx.tolist(), 1):
-            st.write(f"**{i}.** {track_label(idx, state['mappings'], state['idx_to_key'])}")
-
-    st.divider()
-    st.subheader("Explanation: why did KGAT pick this track?")
-    selected = st.selectbox(
-        "Track to explain",
-        options=kgat_idx.tolist(),
-        format_func=lambda x: track_label(int(x), state["mappings"], state["idx_to_key"]),
-    )
-    if selected is None:
-        return
-
-    paths = find_explanation_path(
-        state["model"], state["train_data_dev"],
-        int(user_idx), int(selected), top_k=5,
-        precomputed_attentions=state["attentions"],
-        indexes=state["indexes"],
-    )
-    if not paths:
-        st.info(
-            "No explanation paths found. The model likely picked this track via "
-            "embedding similarity rather than a direct artist/playlist hop."
+        st.divider()
+        st.subheader("Explanation: why did KGAT pick this track?")
+        selected = st.selectbox(
+            "Track to explain",
+            options=kgat_idx.tolist(),
+            format_func=lambda x: track_label(int(x), state["mappings"], state["idx_to_key"]),
         )
-        return
+        if selected is not None:
+            paths = find_explanation_path(
+                state["model"], state["train_data_dev"],
+                int(user_idx), int(selected), top_k=5,
+                precomputed_attentions=state["attentions"],
+                indexes=state["indexes"],
+            )
+            if not paths:
+                st.info(
+                    "No explanation paths found. The model likely picked this track via "
+                    "embedding similarity rather than a direct artist/playlist hop."
+                )
+            else:
+                st.write(f"**Top-{len(paths)} attention paths** "
+                         f"(user {user_idx} → {track_label(int(selected), state['mappings'], state['idx_to_key'])}):")
+                for i, p in enumerate(paths, 1):
+                    path_str = " → ".join(
+                        node_label(nt, idx, state["mappings"], state["idx_to_key"])
+                        for nt, idx in p["path"]
+                    )
+                    st.write(f"{i}. **[{p['type']}]** {path_str}  *(attention {p['attention']:.4f})*")
 
-    st.write(f"**Top-{len(paths)} attention paths** "
-             f"(user {user_idx} → {track_label(int(selected), state['mappings'], state['idx_to_key'])}):")
-    for i, p in enumerate(paths, 1):
-        path_str = " → ".join(
-            node_label(nt, idx, state["mappings"], state["idx_to_key"])
-            for nt, idx in p["path"]
+                # Natural-language Bulgarian renderings of the top paths — one sentence
+                # per path, template-driven (no LLM). Uses the same id_mappings as the
+                # path strings above so labels match.
+                sentences = render_paths_bg(paths, state["mappings"], state["idx_to_key"])
+                if sentences:
+                    st.markdown("**Защо тези препоръки (на български):**")
+                    for s in sentences:
+                        st.markdown(f"- {s}")
+
+                net = render_explanation_graph(paths, state["mappings"], state["idx_to_key"])
+                st.markdown(
+                    '<div style="display:flex;gap:1.2em;font-size:0.9em;margin-bottom:0.4em;">'
+                    '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#4CAF50;border-radius:50%;vertical-align:middle;"></span> user</span>'
+                    '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#2196F3;border-radius:50%;vertical-align:middle;"></span> track</span>'
+                    '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#FF9800;border-radius:50%;vertical-align:middle;"></span> artist</span>'
+                    '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#9C27B0;border-radius:50%;vertical-align:middle;"></span> playlist</span>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+                with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
+                    html_path = Path(tmp.name)
+                net.save_graph(str(html_path))
+                with open(html_path) as f:
+                    st.components.v1.html(f.read(), height=480)
+                html_path.unlink(missing_ok=True)
+
+    st.markdown("---")
+    st.subheader("AI-Generated Tracks You Might Like")
+    if state["suno_df"].empty:
+        st.info("Suno dataset not loaded — run scripts/build_suno_subset.py first.")
+    else:
+        genre_profile, top_artist_names = get_user_genre_profile(
+            user_idx,
+            state["artist_genres"],
+            state["artist_emb"],
+            state["user_emb"],
+            state["idx_to_key"]["artist"],
         )
-        st.write(f"{i}. **[{p['type']}]** {path_str}  *(attention {p['attention']:.4f})*")
-
-    # Natural-language Bulgarian renderings of the top paths — one sentence 
-    # per path, template-driven (no LLM). Uses the same id_mappings as the
-    # path strings above so labels match.
-    sentences = render_paths_bg(paths, state["mappings"], state["idx_to_key"])
-    if sentences:
-        st.markdown("**Защо тези препоръки (на български):**")
-        for s in sentences:
-            st.markdown(f"- {s}")
-
-    net = render_explanation_graph(paths, state["mappings"], state["idx_to_key"])
-    st.markdown(
-        '<div style="display:flex;gap:1.2em;font-size:0.9em;margin-bottom:0.4em;">'
-        '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#4CAF50;border-radius:50%;vertical-align:middle;"></span> user</span>'
-        '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#2196F3;border-radius:50%;vertical-align:middle;"></span> track</span>'
-        '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#FF9800;border-radius:50%;vertical-align:middle;"></span> artist</span>'
-        '<span><span style="display:inline-block;width:0.9em;height:0.9em;background:#9C27B0;border-radius:50%;vertical-align:middle;"></span> playlist</span>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
-        html_path = Path(tmp.name)
-    net.save_graph(str(html_path))
-    with open(html_path) as f:
-        st.components.v1.html(f.read(), height=480)
-    html_path.unlink(missing_ok=True)
+        suno_recs, fallback = query_suno(genre_profile, state["suno_df"])
+        st.caption(explain_suno_recs(
+            genre_profile, top_artist_names,
+            state["mappings"]["artist_display"], fallback,
+        ))
+        for _, row in suno_recs.iterrows():
+            col1, col2 = st.columns([1, 4])
+            col1.image(row["image_url"], width=80)
+            col2.write(f"**{row['title']}**  \n_{_clean_tags(row['metadata_tags'])}_")
+            col2.audio(row["audio_url"])
 
 
 if __name__ == "__main__":

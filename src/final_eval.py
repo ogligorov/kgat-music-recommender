@@ -1,13 +1,9 @@
-"""Final evaluation: load the trained KGAT, score it on the chosen split with
-larger sampled-eval sizes, and run the popularity baseline through the same
-protocol for a side-by-side comparison.
-
-Both KGAT and baseline use the SAME seed, eligible-user sample, and per-user
-candidate sets, so the deltas are apples-to-apples.
+"""Final evaluation: load the trained KGAT, score it on the chosen split, 
+and run the popularity baseline through the same protocol for a side-by-side comparison.
 
 Usage:
-  .venv/bin/python -m src.final_eval --split test
-  .venv/bin/python -m src.final_eval --split val --n-users 1000 --n-negatives 2000
+  python -m src.final_eval --split test
+  python -m src.final_eval --split val --n-users 1000 --n-negatives 2000
 """
 
 import argparse
@@ -102,7 +98,6 @@ def main():
     args = parser.parse_args()
 
     cfg = Config()
-    # Override only the two sampling knobs.
     cfg.n_eval_users = args.n_users
     cfg.n_eval_negatives = args.n_negatives
     device = torch.device(cfg.device)

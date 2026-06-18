@@ -1,20 +1,3 @@
-"""Pick a (user, track) pair worth explaining and print the CLI invocation.
-
-We want a *successful* recommendation: a held-out positive that the trained
-KGAT actually pushes into the user's top-K. Otherwise the explanation paths
-just rationalize a wrong answer.
-
-We also prefer a target track that has BOTH an artist hub and at least one
-playlist co-occurrence with a track the user already liked, so all three
-path types in explain.py (direct / via_artist / via_playlist) have a chance
-to compete in the top-k.
-
-Run:
-  .venv/bin/python -m src.pick_explain_pair
-Then feed the printed --user/--track into:
-  .venv/bin/python -m src.explain --user N --track M --fidelity-samples 100
-"""
-
 import torch
 from torch_geometric.loader import NeighborLoader
 
@@ -26,8 +9,6 @@ from src.model import KGAT
 
 def main():
     cfg = Config()
-    # Skip MPS — PyG NeighborLoader triggers aten::_convert_indices_from_coo_to_csr
-    # which is unimplemented on MPS. See app.py for the same guard.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading graph from {cfg.processed_data_dir / 'graph.pt'}...")
@@ -69,17 +50,14 @@ def main():
     n_users = data["user"].num_nodes
     n_tracks = data["track"].num_nodes
 
-    # Per-user train positives (mask out for ranking).
     train_pos: dict[int, set[int]] = {}
     for u, t in zip(train_edges[0].tolist(), train_edges[1].tolist()):
         train_pos.setdefault(u, set()).add(t)
 
-    # Per-user test positives (the held-out targets).
     test_pos: dict[int, set[int]] = {}
     for u, t in zip(test_edges[0].tolist(), test_edges[1].tolist()):
         test_pos.setdefault(u, set()).add(t)
 
-    # Hub presence per track.
     perf = data["track", "performed_by", "artist"].edge_index
     in_pl = data["track", "in_playlist", "playlist"].edge_index
     track_to_artist: dict[int, int] = {}
@@ -89,7 +67,6 @@ def main():
     for t, p in zip(in_pl[0].tolist(), in_pl[1].tolist()):
         track_to_playlists.setdefault(t, set()).add(p)
 
-    # Embed all users + all tracks once via the train-only graph.
     print("Computing user embeddings...")
     user_emb = compute_final_embeddings(
         model, train_data, "user", cfg, device,
@@ -101,8 +78,6 @@ def main():
         input_nodes=torch.arange(n_tracks),
     )
 
-    # Walk eligible users in deterministic order; first user whose top-20 contains
-    # a test positive whose target track has artist hub + playlist hub overlap.
     eligible = sorted(test_pos.keys())
     print(f"Scanning {len(eligible)} users with held-out positives...")
 
@@ -111,8 +86,7 @@ def main():
         gt = test_pos[uid]
         tr_pos = train_pos.get(uid, set())
 
-        scores = user_emb[uid] @ track_emb.T  # (n_tracks,)
-        # Mask out the user's train positives so we score against unseen tracks.
+        scores = user_emb[uid] @ track_emb.T
         scores_masked = scores.clone()
         if tr_pos:
             scores_masked[torch.tensor(sorted(tr_pos), dtype=torch.long)] = -1e9
@@ -127,8 +101,7 @@ def main():
             target_pls = track_to_playlists.get(target, set())
             if artist is None or not target_pls:
                 continue
-            # Cap to first 50 likes so power users with hundreds of likes
-            # don't blow up the hub scan.
+            # Caps to first 50 likes so power users with hundreds of likes won't blow up the hub scan
             user_liked_tracks = sorted(tr_pos)[:50]
             shares_artist = any(
                 track_to_artist.get(t) == artist

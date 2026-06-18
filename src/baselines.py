@@ -1,10 +1,3 @@
-"""Baseline recommenders for comparison.
-
-Track-popularity baseline mirrors the sampled-metrics protocol from
-evaluate.py so KGAT vs. baseline numbers are directly comparable
-(same eligible users, same per-user candidate sets, same train-positive masking).
-"""
-
 import numpy as np
 import torch
 from torch_geometric.data import HeteroData
@@ -87,8 +80,7 @@ def track_popularity_baseline(
 
 @torch.no_grad()
 def score_cold_user(data: HeteroData, top_k: int) -> list[int]:
-    """Top-K most popular tracks (by train likers). Used by app.py for users
-    not in the training-time mapping (cold-start fallback)."""
+    """Top-K most popular tracks (by train likers)."""
     train_mask = data["user", "liked", "track"].train_mask
     train_edges = data["user", "liked", "track"].edge_index[:, train_mask]
     n_tracks = data["track"].num_nodes
@@ -97,7 +89,6 @@ def score_cold_user(data: HeteroData, top_k: int) -> list[int]:
 
 
 def main():
-    """Sanity-check the baseline against val (sampled metrics)."""
     cfg = Config()
     print(f"Loading graph from {cfg.processed_data_dir / 'graph.pt'}...")
     data = torch.load(cfg.processed_data_dir / "graph.pt", weights_only=False)
